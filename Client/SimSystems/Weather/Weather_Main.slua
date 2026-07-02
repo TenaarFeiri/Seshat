@@ -1,0 +1,135 @@
+--
+-- Main script for the Seshat weather system. It conducts surrounding scripts and serves as primary controller for the system,
+-- incl. managing reboots, collating data, and so on.
+-- See Documentation in the repo for architecture and design details.
+--
+
+--============== Constants =============--
+local API -- Defined at the bottom of the page.
+local SCRIPT_ID = "MAIN"
+--======================================--
+
+--=============== Tables ===============--
+local events = {} -- Holds registrations for events.
+
+--======================================--
+
+--============= Utilities ==============--
+-- Important utility functions to make my life easier.
+
+local function read(lsdKey, ...): string
+    local password = ... or false
+    if password then
+        return ll.LinksetDataReadProtected(lsdKey, password)
+    else
+        return ll.LinksetDataRead(lsdKey)
+    end
+end
+
+local function write(keyName, value, ...): number -- Returns 0 success, error code otherwise.
+    local password = ... or false
+    if password then
+        return ll.LinksetDataWriteProtected(keyName, value, password)
+    else
+        return ll.LinksetDataWrite(keyName, value)
+    end
+end
+
+local function api_exists(callback_name: string): boolean
+    return API and API.callbacks and API.callbacks[callback_name] ~= nil
+end
+
+local function parse_link_message_to_table(link_int, link_message)
+    -- Stub.
+    -- Intended to translate link messages to tables for processing.
+    -- Link messages can contain instructions for Main or other data types.
+    -- link_int is the integer provided from the link/script that sent the message,
+    -- NOT the link number in the set.
+    local result = {}
+
+    -- Format:
+
+    return result
+end
+
+local function process_struct(struct: table)
+    for key, value in pairs(struct) do
+        if type(value) == "table" then
+            -- Check if this table contains an event
+            if value.event and api_exists(value.event) then
+                local params = value.params or {}
+                API.callbacks[value.event](unpack(params))
+            else
+                -- Recursively process nested tables
+                process_struct(value)
+            end
+        end
+    end
+end
+
+--=============== System ===============--
+
+--=============== Events ===============--
+
+-- Register linkset data event so we can respond to LSD updates.
+events.linkset_data = LLEvents:on("linkset_data", function(action: number, name: string, value: string)
+    -- Stub.
+    -- Intended to handle linkset data updates.
+end)
+
+events.link_message = LLEvents:on("link_message", function(sender_num: number, num: number, str: string, id: string)
+    -- Decode from JSON (always flat arrays)
+    local data = lljson.decode(str)
+
+    -- Probably not for us.
+    if not data["to"] or data["to"] ~= SCRIPT_ID then
+        return
+    end
+
+    -- All link messages must have a type.
+    if not data["type"] then
+        return
+    end
+    
+    -- Link messages always return a table with a structure map so we can
+    -- automate reading and processing.
+    if not data["struct"] or type(data["struct"]) ~= "table" then
+        return
+    end
+
+    -- Struct contains every key and subkey in the table.
+    -- Table could be multidimensional, so we need to handle that.
+    local struct = data["struct"]
+
+    -- Struct could look like this:
+    -- {
+    --     1: {
+    --         "event": "SYSTEM_REBOOT",
+    --         "params": something
+    --     },
+    --     2: true
+    -- }
+    -- We iterate over the table and when we detect an event, we invoke the callback along with params, if any.
+
+    if data["type"] == "event" then
+        -- This is an event, which means we can process it.
+        process_struct(struct)
+    end
+    
+end)
+
+--============== API ===============--
+-- API declared LAST so it has access to everything else.
+API = {
+    version = 0000001,
+    callbacks = {
+        SYSTEM_REBOOT = function(exceptions: { [string]: boolean }) 
+            -- Handle system reboot with exceptions
+            -- todo: add logic
+            return end,
+        SOME_CALL = function() 
+            -- Handle some call
+            print("Some call")
+            return end,
+    }
+}
