@@ -45,7 +45,7 @@ local function parse_link_message_to_table(link_int: number, link_message: strin
 
     -- Check if decoding was successful
     if not success then
-        print("Failed to decode JSON: " .. data)
+        print("Failed to decode JSON: " .. data .. " | " .. link_int .. " | " .. link_message)
         return false, nil
     elseif not data["type"] or type(data["type"]) ~= "string" then
         return false, nil
