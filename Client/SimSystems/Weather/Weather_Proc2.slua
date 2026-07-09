@@ -62,6 +62,7 @@ local NOISE_SCALE_DEFAULT = 0.05   -- Default stochastic perturbation scale
 local TWO_PI = 2 * math.pi
 local HOURS_PER_DAY = 24
 local SECONDS_PER_HOUR = 3600
+local SL_DAY_CYCLE_SECONDS = 13 * SECONDS_PER_HOUR  -- Sim's day cycle length (13 hours)
 
 -- Wind direction: cardinal to degrees mapping (from SIMULATION_MATHS.md section 3)
 local CARDINAL_TO_DEGREES: { [string]: number } = {
@@ -154,13 +155,17 @@ end
 
 -- Compute the diurnal temperature for a grid based on sun position.
 -- temp = temp_base + temp_diurnal * sin(sun_angle - phase_offset)
--- The sun angle is derived from the current SL time of day.
+-- The sun angle is derived from ll.GetTimeOfDay(), which returns seconds
+-- since SL midnight per the parcel's day cycle settings. We map the SL day
+-- fraction to a 24-hour equivalent so temp_phase (e.g. 14 = 2pm) works as
+-- a familiar 24-hour clock hour regardless of the actual day cycle length.
 local function compute_diurnal_temperature(temp_base: number, temp_diurnal: number, temp_phase: number): number
-    -- Get the current time of day in hours (0-24)
-    local current_time_string: string = os.date("%H:%M:%S")
-    local current_hour: number = tonumber(string.sub(current_time_string, 1, 2)) or 12
-    local current_minute: number = tonumber(string.sub(current_time_string, 4, 5)) or 0
-    local time_of_day_hours: number = current_hour + current_minute / 60
+    -- Get the current SL time of day as a fraction of the day cycle (0-1)
+    local sl_seconds: number = ll.GetTimeOfDay()
+    local day_fraction: number = (sl_seconds % SL_DAY_CYCLE_SECONDS) / SL_DAY_CYCLE_SECONDS
+
+    -- Map to a 24-hour equivalent so temp_phase values (e.g. 14 = 2pm) are intuitive
+    local time_of_day_hours: number = day_fraction * HOURS_PER_DAY
 
     -- Convert to angular position (0 at midnight, pi at noon)
     local sun_angle: number = (time_of_day_hours / HOURS_PER_DAY) * TWO_PI
@@ -184,7 +189,9 @@ local function cardinal_to_degrees(cardinal: string): number
 end
 
 -- Evolve wind direction toward target, handling the 0-360 wraparound.
-local function relax_wind_direction(current_degrees: number, target_degrees: number, rate: number): number
+-- Adds angular noise scaled by variability so the wind wanders naturally
+-- around the target direction instead of converging to a fixed point.
+local function relax_wind_direction(current_degrees: number, target_degrees: number, rate: number, variability: number): number
     -- Find the shortest angular path between current and target
     local delta: number = target_degrees - current_degrees
     if delta > 180 then
@@ -194,6 +201,12 @@ local function relax_wind_direction(current_degrees: number, target_degrees: num
     end
 
     local new_direction: number = current_degrees + delta * rate
+
+    -- Angular noise: wander up to ±(variability * 60) degrees per cycle
+    -- At variability=0.2 (Clear Skies), that's ±12° per cycle
+    -- At variability=0.7 (Khamsin), that's ±42° per cycle
+    local noise: number = (math.random() - 0.5) * 2 * variability * 60
+    new_direction = new_direction + noise
 
     -- Wrap to 0-360 range
     if new_direction < 0 then
@@ -299,10 +312,14 @@ local function evolve_grid_micro(grid_uuid: string): ()
     local computed_humidity: number = relax_value(current_humidity, target_humidity, RELAXATION_RATE, NOISE_SCALE_DEFAULT)
 
     -- ===== Pressure (relaxed toward target + background driver offset) =====
+    -- The driver offset is NOT stored in micro:pressure — only the base
+    -- (relaxed) value is persisted. The offset is added on top for the
+    -- computed value sent to the grid. This prevents the offset from
+    -- compounding across cycles.
     local current_pressure: number = micro_pressure.current or targets.pressure or 1013
     local target_pressure: number = targets.pressure or 1013
     local evolved_pressure: number = relax_value(current_pressure, target_pressure, RELAXATION_RATE, NOISE_SCALE_DEFAULT)
-    -- Mix in the background pressure driver from Proc3
+    -- Mix in the background pressure driver from Proc3 (not persisted)
     local computed_pressure: number = evolved_pressure + pressure_driver_offset
 
     -- ===== Wind speed (relaxed toward target with variability noise) =====
@@ -313,15 +330,31 @@ local function evolve_grid_micro(grid_uuid: string): ()
     -- ===== Wind direction (angular interpolation toward target) =====
     local current_wind_dir: number = micro_wind_dir.current or 0
     local target_wind_dir: number = cardinal_to_degrees(targets.wind_dir or "N")
-    local computed_wind_dir: number = relax_wind_direction(current_wind_dir, target_wind_dir, RELAXATION_RATE)
+    local computed_wind_dir: number = relax_wind_direction(current_wind_dir, target_wind_dir, RELAXATION_RATE, wind_variability)
 
     -- ===== Maritime influence (wind direction → temperature/humidity bias) =====
     -- Wind from the sea cools and humidifies; wind from inland heats and dries.
+    -- The humidity boost is capped by the state's sea_humidity_cap target
+    -- (if defined) so maritime influence can't push humidity beyond what
+    -- the state's climate profile allows.
     local sea_direction: any = meta.sea_direction
     local maritime: number = compute_maritime_influence(computed_wind_dir, sea_direction)
     if maritime ~= 0 then
         computed_temp = computed_temp - maritime * SEA_TEMP_MODIFIER
-        computed_humidity = computed_humidity + maritime * SEA_HUMIDITY_MODIFIER
+
+        local humidity_boost: number = maritime * SEA_HUMIDITY_MODIFIER
+        local sea_humidity_cap: number = targets.sea_humidity_cap
+        if sea_humidity_cap then
+            -- Cap the total humidity, not just the boost
+            local capped_humidity: number = computed_humidity + humidity_boost
+            if capped_humidity > sea_humidity_cap then
+                capped_humidity = sea_humidity_cap
+            end
+            computed_humidity = capped_humidity
+        else
+            computed_humidity = computed_humidity + humidity_boost
+        end
+
         -- Clamp humidity to valid range
         if computed_humidity < 0 then computed_humidity = 0 end
         if computed_humidity > 100 then computed_humidity = 100 end
@@ -350,7 +383,7 @@ local function evolve_grid_micro(grid_uuid: string): ()
     -- Write all computed values back to micro LSD keys
     lsd_write_json(grid_uuid .. ":micro:temp", {current = computed_temp})
     lsd_write_json(grid_uuid .. ":micro:humidity", {current = computed_humidity})
-    lsd_write_json(grid_uuid .. ":micro:pressure", {current = computed_pressure})
+    lsd_write_json(grid_uuid .. ":micro:pressure", {current = evolved_pressure})
     lsd_write_json(grid_uuid .. ":micro:wind_speed", {current = computed_wind_speed})
     lsd_write_json(grid_uuid .. ":micro:wind_dir", {current = computed_wind_dir})
     lsd_write_json(grid_uuid .. ":micro:precipitation", {current = computed_precipitation})

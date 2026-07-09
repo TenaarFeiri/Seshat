@@ -328,6 +328,7 @@ Payload schemas are not yet specified. The operations below are the current set.
 | 11 | `ADMIN_DUMP` | Main → Grid | Admin command: dump current state data to owner chat |
 | 12 | `ADMIN_DEBUG` | Main → Grid | Admin command: toggle debug message echoing |
 | 13 | `BEACON` | Main → all grids (broadcast) | Discovery broadcast: carries the processor object's key so grids can target subsequent messages via `llRegionSayTo` |
+| 14 | `ADMIN_HISTORY` | Main → Grid | Admin command: dump transition history (last 20) to owner chat |
 
 Assignment and removal are handled by Main writing directly to the `grids` CSV in the shared LSD. Processors follow the registry silently — no explicit assignment or drop messages are needed.
 

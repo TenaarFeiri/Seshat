@@ -44,6 +44,7 @@ local OP = {
     ADMIN_DUMP   = 11,  -- Admin: dump state to owner chat (Main → Grid)
     ADMIN_DEBUG  = 12,  -- Admin: toggle debug mode (Main → Grid)
     BEACON       = 13,  -- Main → all grids: discovery broadcast with processor key
+    ADMIN_HISTORY = 14, -- Admin: dump transition history to owner chat (Main → Grid)
 }
 
 -- Recipient IDs (from COMMS_PROTOCOL.md recipient table)
@@ -60,6 +61,7 @@ local LSD_KEY_CONFIG = "config"
 local LSD_KEY_STATE = "state"
 local LSD_KEY_TRANSITION = "transition"
 local LSD_KEY_PROCESSOR_KEY = "processor_key"  -- Discovered via beacon, not notecard
+local LSD_KEY_TRANSITION_HISTORY = "transition_history"  -- Last 20 transitions for debugging
 
 -- Zone bounding-box fields (defined in the notecard {grid} section)
 local ZONE_FIELDS = { "min_x", "min_y", "min_z", "max_x", "max_y", "max_z" }
@@ -83,6 +85,7 @@ local SEASON_PERET_END_DAY = 9
 local PRESSURE_TREND_WINDOW_SECONDS = 300    -- 5-minute evaluation window
 local PRESSURE_HISTORY_RETENTION_SECONDS = 600  -- 10-minute retention
 local TRANSITION_COOLDOWN_CYCLES = 3         -- Cycles to wait after a transition
+local TRANSITION_HISTORY_MAX = 20            -- Max entries in transition history log
 
 -- Bootstrap evaluation thresholds (from SIMULATION_MATHS.md section 6)
 local BOOTSTRAP_DELTA_EVENT_HPA = -8   -- Pressure >8 hPa below baseline → event state
@@ -363,11 +366,28 @@ local function process_notecard_line(raw_line: string): ()
     end
 end
 
+-- Wipe notecard-sourced LSD data (config + all season:state keys) before
+-- reloading the notecard. Preserves runtime keys: state, transition, processor_key.
+local SEASON_NAMES = { SEASON_AKHET, SEASON_PERET, SEASON_SHEMU }
+local function wipe_notecard_lsd(): ()
+    lsd_delete(LSD_KEY_CONFIG)
+    local all_keys: {string} = ll.LinksetDataListKeys(1, 0)
+    for _, key in ipairs(all_keys) do
+        -- Season:state keys contain a colon; runtime keys don't
+        if string.find(key, ":") then
+            lsd_delete(key)
+        end
+    end
+end
+
 -- Start loading the notecard from the prim's inventory.
 -- GetNumberOfNotecardLines is async — it returns a query ID, and the actual
 -- line count arrives via a dataserver event. We store the query ID and start
 -- requesting lines only after the count is known.
 local function start_notecard_load(): ()
+    -- Wipe stale notecard-sourced LSD data before loading fresh data
+    wipe_notecard_lsd()
+
     notecard_line_number = 1
     current_scope = ""
     current_season = ""
@@ -462,6 +482,8 @@ local function extract_targets_from_state(state_def: any): any
         flood_receding_humidity = state_def.flood_receding_humidity,
         flood_low_dust = state_def.flood_low_dust,
         flood_rising_humidity = state_def.flood_rising_humidity,
+        -- Maritime influence cap
+        sea_humidity_cap = state_def.sea_humidity_cap,
     }
 end
 
@@ -706,12 +728,21 @@ local function pick_among_ready(ready_candidates: {{def: any, name: string}}, se
 end
 
 -- Evaluate progression for the current state.
--- Returns the new state definition if a transition should occur, or nil to stay.
-local function evaluate_progression(current_state_def: any, season: string, current_values: any, transition_state: any): any
+-- Returns (new_state_def, reason_string) if a transition should occur, or (nil, nil) to stay.
+local function evaluate_progression(current_state_def: any, season: string, current_values: any, transition_state: any): (any, string)
     -- Don't transition if in cooldown
     if transition_state.cooldown and transition_state.cooldown > 0 then
         transition_state.cooldown = transition_state.cooldown - 1
-        return nil
+        return nil, ""
+    end
+
+    -- Don't evaluate progression conditions if minimum duration hasn't been reached.
+    -- The duration timer still ticks up so duration expiry can fire after the max.
+    local duration_min: number = transition_state.duration_min or 0
+    local duration_timer: number = (transition_state.duration_timer or 0) + 1
+    transition_state.duration_timer = duration_timer
+    if duration_timer < duration_min then
+        return nil, ""
     end
 
     -- Check for forced lock — if locked, no transitions
@@ -722,7 +753,7 @@ local function evaluate_progression(current_state_def: any, season: string, curr
             transition_state.lock = nil
             -- Fall through to normal evaluation
         else
-            return nil
+            return nil, ""
         end
     end
 
@@ -749,7 +780,7 @@ local function evaluate_progression(current_state_def: any, season: string, curr
     local candidates: {{type: string, name: string}} = gather_progression_candidates(current_state_def)
 
     -- Check which candidates have their condition met
-    local ready: {{def: any, name: string}} = {}
+    local ready: {{def: any, name: string, path_type: string}} = {}
     for _, cand in ipairs(candidates) do
         local def: any = get_state_definition(season, cand.name)
         if def then
@@ -770,7 +801,7 @@ local function evaluate_progression(current_state_def: any, season: string, curr
                 if active_bias_target and cand.name == active_bias_target then
                     def.weight = (def.weight or 1) * bias_weight_multiplier
                 end
-                table.insert(ready, {def = def, name = cand.name})
+                table.insert(ready, {def = def, name = cand.name, path_type = cand.type})
             end
         end
     end
@@ -779,22 +810,22 @@ local function evaluate_progression(current_state_def: any, season: string, curr
     if #ready == 1 then
         transition_state.cooldown = TRANSITION_COOLDOWN_CYCLES
         transition_state.duration_timer = 0
-        return ready[1].def
+        return ready[1].def, ready[1].path_type .. " condition met → " .. ready[1].name
     end
 
     -- If multiple candidates are ready, use weight as tiebreaker
     if #ready > 1 then
         local chosen: any = pick_among_ready(ready, season)
+        local chosen_name: string = chosen._name or "Unknown"
         transition_state.cooldown = TRANSITION_COOLDOWN_CYCLES
         transition_state.duration_timer = 0
-        return chosen
+        return chosen, "multiple conditions met, weighted pick → " .. chosen_name
     end
 
     -- No candidates ready — check duration expiry
-    transition_state.duration_timer = (transition_state.duration_timer or 0) + 1
     local duration_target: number = transition_state.duration_target or 999
 
-    if transition_state.duration_timer >= duration_target then
+    if duration_timer >= duration_target then
         -- Duration expired — prefer regression, then progression
         for _, cand in ipairs(candidates) do
             if cand.type == "regress" then
@@ -802,7 +833,7 @@ local function evaluate_progression(current_state_def: any, season: string, curr
                 if def then
                     transition_state.cooldown = TRANSITION_COOLDOWN_CYCLES
                     transition_state.duration_timer = 0
-                    return def
+                    return def, "duration expired, regress → " .. cand.name
                 end
             end
         end
@@ -812,13 +843,13 @@ local function evaluate_progression(current_state_def: any, season: string, curr
                 if def then
                     transition_state.cooldown = TRANSITION_COOLDOWN_CYCLES
                     transition_state.duration_timer = 0
-                    return def
+                    return def, "duration expired, progress → " .. cand.name
                 end
             end
         end
     end
 
-    return nil
+    return nil, ""
 end
 
 --================================================//
@@ -892,6 +923,12 @@ local function choose_duration_cycles(duration_str: string): number
     local min_hours, max_hours = parse_duration(duration_str)
     local chosen_hours: number = min_hours + math.random() * (max_hours - min_hours)
     return math.floor(chosen_hours * CYCLES_PER_HOUR)
+end
+
+-- Convert the minimum duration from the range to poll cycles.
+local function min_duration_cycles(duration_str: string): number
+    local min_hours, _ = parse_duration(duration_str)
+    return math.floor(min_hours * CYCLES_PER_HOUR)
 end
 
 --================================================//
@@ -969,19 +1006,22 @@ end
 
 --========= State Transition Handling =========--
 
--- Handle a state transition: update transition state, push new targets.
-local function execute_state_transition(new_state_def: any, season: string, transition_state: any): ()
+-- Handle a state transition: update transition state, push new targets, log history.
+local function execute_state_transition(new_state_def: any, season: string, transition_state: any, reason: string): ()
     local new_state_name: string = new_state_def._name or "Unknown"
+    local old_state_name: string = transition_state.current or "Unknown"
 
     -- Update transition state
     transition_state.current = new_state_name
     transition_state.season = season
     transition_state.cooldown = TRANSITION_COOLDOWN_CYCLES
     transition_state.duration_timer = 0
+    transition_state.state_changed_at = os.time()
 
-    -- Parse and set duration target
+    -- Parse and set duration target and minimum
     local duration_str: string = new_state_def.duration or "1-6"
     transition_state.duration_target = choose_duration_cycles(duration_str)
+    transition_state.duration_min = min_duration_cycles(duration_str)
 
     -- Write transition state back to LSD
     lsd_write_json(LSD_KEY_TRANSITION, transition_state)
@@ -998,7 +1038,22 @@ local function execute_state_transition(new_state_def: any, season: string, tran
     state.particle = new_state_def.particle or "none"
     lsd_write_json(LSD_KEY_STATE, state)
 
-    ll.OwnerSay("[" .. SCRIPT_ID .. "] State transition: " .. new_state_name)
+    -- Record in transition history
+    local history: any = lsd_read_json(LSD_KEY_TRANSITION_HISTORY) or {}
+    table.insert(history, {
+        ts = os.time(),
+        from = old_state_name,
+        to = new_state_name,
+        reason = reason,
+    })
+    -- Trim to last N entries
+    while #history > TRANSITION_HISTORY_MAX do
+        table.remove(history, 1)
+    end
+    lsd_write_json(LSD_KEY_TRANSITION_HISTORY, history)
+
+    ll.OwnerSay("[" .. SCRIPT_ID .. "] State transition: " .. old_state_name .. " → " .. new_state_name
+        .. " (" .. reason .. ")")
 end
 
 --================================================//
@@ -1007,18 +1062,50 @@ end
 
 -- Process a STATE_RESP from the processor.
 -- Updates the grid's runtime state, records pressure, evaluates transitions.
+-- Convert wind direction in degrees to a 16-point cardinal string.
+local DEGREES_TO_CARDINAL: {string} = {
+    "N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE",
+    "S", "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW",
+}
+local function degrees_to_cardinal(degrees: number): string
+    -- Normalize to 0-360
+    local normalized: number = degrees % 360
+    if normalized < 0 then normalized = normalized + 360 end
+    local index: number = math.floor((normalized + 11.25) / 22.5) % 16 + 1
+    return DEGREES_TO_CARDINAL[index]
+end
+
+-- Convert wind speed (kph) to a descriptive label (Beaufort-inspired, word-only).
+local function wind_label(kph: number): string
+    if kph < 1 then return "Calm" end
+    if kph < 6 then return "Light air" end
+    if kph < 12 then return "Light breeze" end
+    if kph < 20 then return "Gentle breeze" end
+    if kph < 29 then return "Moderate breeze" end
+    if kph < 39 then return "Fresh breeze" end
+    if kph < 50 then return "Strong breeze" end
+    if kph < 62 then return "Near gale" end
+    if kph < 75 then return "Gale" end
+    if kph < 89 then return "Strong gale" end
+    if kph < 103 then return "Storm" end
+    if kph < 118 then return "Violent storm" end
+    return "Hurricane"
+end
+
 -- Update the prim's floating text with current weather data (for testing).
 -- ll.SetText has a 255-char limit — keep the format compact.
 local function update_display(state: any): ()
     local line1: string = tostring(state.current_state or "?") .. " (" .. tostring(state.season or "?") .. ")"
     local line2: string = "T:" .. string.format("%.1f", state.temp or 0)
-        .. "C  H:" .. tostring(state.humidity or 0)
+        .. "C  H:" .. string.format("%.0f", state.humidity or 0)
         .. "%  P:" .. string.format("%.0f", state.pressure or 0)
-    local line3: string = "Wind:" .. tostring(state.wind_speed or 0)
-        .. " " .. tostring(state.wind_dir or "?")
-        .. "  Dust:" .. tostring(state.dust or 0)
-        .. "  Vis:" .. tostring(state.visibility or 0)
-    local line4: string = "Rain:" .. tostring(state.precipitation or 0)
+    local wind_speed: number = state.wind_speed or 0
+    local wind_dir: number = state.wind_dir or 0
+    local line3: string = wind_label(wind_speed)
+        .. " " .. degrees_to_cardinal(wind_dir)
+    local line4: string = "Dust:" .. string.format("%.0f", math.max(0, state.dust or 0))
+        .. "  Vis:" .. string.format("%.0f", state.visibility or 0)
+        .. "  Rain:" .. string.format("%.0f", math.max(0, state.precipitation or 0))
     local text: string = line1 .. "\n" .. line2 .. "\n" .. line3 .. "\n" .. line4
     ll.SetText(text, vector.create(1, 1, 1), 1)
 end
@@ -1067,7 +1154,7 @@ local function handle_state_resp(values: any, evolution: any): ()
             bootstrap_state._name = bootstrap_state._name or "Unknown"
             -- Look up the actual state name from the season's states
             -- For now, use the bootstrap result directly
-            execute_state_transition(bootstrap_state, season, transition_state)
+            execute_state_transition(bootstrap_state, season, transition_state, "bootstrap: pressure delta from baseline")
             return
         end
         -- No bootstrap transition needed — stay in Clear Skies
@@ -1084,10 +1171,10 @@ local function handle_state_resp(values: any, evolution: any): ()
         return
     end
 
-    local new_state_def: any = evaluate_progression(current_state_def, season, values, transition_state)
+    local new_state_def: any, reason: string = evaluate_progression(current_state_def, season, values, transition_state)
 
     if new_state_def then
-        execute_state_transition(new_state_def, season, transition_state)
+        execute_state_transition(new_state_def, season, transition_state, reason)
     else
         -- No transition — save the updated transition state (with new pressure reading)
         lsd_write_json(LSD_KEY_TRANSITION, transition_state)
@@ -1154,9 +1241,11 @@ register_with_main = function(): ()
         pressure_history = {},
         duration_timer = 0,
         duration_target = choose_duration_cycles(clear_skies.duration or "4-9"),
+        duration_min = min_duration_cycles(clear_skies.duration or "4-9"),
         cooldown = 0,
         lock = nil,
         target_bias = nil,
+        state_changed_at = os.time(),
     }
     lsd_write_json(LSD_KEY_TRANSITION, transition_state)
 
@@ -1178,36 +1267,21 @@ register_with_main = function(): ()
 end
 
 -- Initialize the grid controller on script start.
+-- Always reloads the notecard on boot — LSD cached data is stale if the
+-- notecard has been edited. The processor key and runtime state persist
+-- in LSD across resets; only notecard-sourced data (config + state defs)
+-- is overwritten by the fresh load.
 local function boot_grid_controller(): ()
     -- Start listening on the comms channel immediately so we can hear
     -- Main's discovery beacon, even before the notecard is loaded.
     ll.Listen(COMMS_CHANNEL, "", "", "")
 
-    -- Check if notecard data is already in LSD (from a previous boot)
-    local config: any = lsd_read_json(LSD_KEY_CONFIG)
-    if config and next(config) then
-        notecard_loaded = true
-        ll.OwnerSay("[" .. SCRIPT_ID .. "] Notecard data found in LSD. Skipping notecard load.")
-    else
-        -- Need to load the notecard from inventory
-        ll.OwnerSay("[" .. SCRIPT_ID .. "] Loading notecard: " .. NOTECARD_NAME)
-        start_notecard_load()
-        -- Registration will happen after notecard load completes AND
-        -- a beacon from Main is received (both conditions checked in
-        -- handle_notecard_line_data and the beacon handler respectively)
-        return
-    end
-
-    -- Notecard already loaded — check if we already know the processor key
-    local processor_key: string = lsd_read(LSD_KEY_PROCESSOR_KEY)
-    if processor_key ~= "" then
-        -- We have both notecard and processor key — register and start polling
-        register_with_main()
-        start_polling()
-    else
-        -- Notecard loaded but no processor key yet — wait for beacon
-        ll.OwnerSay("[" .. SCRIPT_ID .. "] Notecard loaded. Waiting for processor beacon...")
-    end
+    -- Always load the notecard from inventory
+    ll.OwnerSay("[" .. SCRIPT_ID .. "] Loading notecard: " .. NOTECARD_NAME)
+    start_notecard_load()
+    -- Registration will happen after notecard load completes AND
+    -- a beacon from Main is received (both conditions checked in
+    -- handle_notecard_line_data and the beacon handler respectively)
 end
 
 --================================================//
@@ -1275,16 +1349,59 @@ local function handle_admin_dump(): ()
     ll.OwnerSay("  EEP: " .. tostring(state.eep_preset or "none"))
     ll.OwnerSay("  Particle: " .. tostring(state.particle or "none"))
 
+    -- Transition tracking
+    local changed_at: number = transition.state_changed_at or 0
+    if changed_at > 0 then
+        local elapsed_min: number = math.floor((os.time() - changed_at) / 60)
+        ll.OwnerSay("  State changed: " .. tostring(elapsed_min) .. " min ago")
+    end
+
+    local duration_timer: number = transition.duration_timer or 0
+    local duration_min: number = transition.duration_min or 0
+    local duration_target: number = transition.duration_target or 0
+    local timer_hours: number = duration_timer / CYCLES_PER_HOUR
+    local min_hours: number = duration_min / CYCLES_PER_HOUR
+    local max_hours: number = duration_target / CYCLES_PER_HOUR
+    ll.OwnerSay("  Duration: " .. string.format("%.1f", timer_hours) .. "h / "
+        .. string.format("%.0f", min_hours) .. "-" .. string.format("%.0f", max_hours) .. "h")
+
+    local cooldown: number = transition.cooldown or 0
+    if cooldown > 0 then
+        ll.OwnerSay("  Cooldown: " .. tostring(cooldown) .. " cycles")
+    end
+
+    -- Pressure trend
+    if transition.pressure_history and #transition.pressure_history > 0 then
+        ll.OwnerSay("  Pressure history entries: " .. tostring(#transition.pressure_history))
+        local trend: number = compute_pressure_trend(transition)
+        ll.OwnerSay("  Pressure trend: " .. string.format("%.3f", trend) .. " hPa/min")
+    end
+
     if transition.target_bias then
         ll.OwnerSay("  Target bias: " .. tostring(transition.target_bias.target_state))
     end
     if transition.lock and transition.lock.locked then
         ll.OwnerSay("  Locked: " .. tostring(transition.lock.forced_state))
     end
-    if transition.pressure_history then
-        ll.OwnerSay("  Pressure history entries: " .. tostring(#transition.pressure_history))
-    end
     ll.OwnerSay("  === END DUMP ===")
+end
+
+-- Handle OP.ADMIN_HISTORY: dump transition history to owner chat.
+local function handle_admin_history(): ()
+    local history: any = lsd_read_json(LSD_KEY_TRANSITION_HISTORY) or {}
+
+    ll.OwnerSay("[" .. SCRIPT_ID .. "] === TRANSITION HISTORY (" .. tostring(#history) .. " entries) ===")
+    if #history == 0 then
+        ll.OwnerSay("  (no transitions recorded yet)")
+    else
+        for i, entry in ipairs(history) do
+            local elapsed_min: number = math.floor((os.time() - (entry.ts or 0)) / 60)
+            ll.OwnerSay("  [" .. tostring(i) .. "] " .. tostring(entry.from) .. " → " .. tostring(entry.to)
+                .. "  (" .. tostring(elapsed_min) .. " min ago)"
+                .. "\n        " .. tostring(entry.reason or "?"))
+        end
+    end
+    ll.OwnerSay("  === END HISTORY ===")
 end
 
 -- Handle OP.ADMIN_DEBUG: toggle debug mode.
@@ -1366,6 +1483,9 @@ LLEvents:on("listen", function(channel: number, name: string, sender_uuid: strin
         elseif op_id == OP.ADMIN_DUMP then
             handle_admin_dump()
 
+        elseif op_id == OP.ADMIN_HISTORY then
+            handle_admin_history()
+
         elseif op_id == OP.ADMIN_DEBUG then
             local enable_debug: boolean = payload[1]
             handle_admin_debug(enable_debug)
@@ -1388,6 +1508,16 @@ end)
 -- Linkset data event: stub for future use.
 LLEvents:on("linkset_data", function(action: number, name: string, value: string)
     -- Future: react to external LSD changes.
+end)
+
+-- Changed event: reload notecard when inventory changes (e.g. notecard edited).
+LLEvents:on("changed", function(change: number)
+    if bit32.btest(change, CHANGED_INVENTORY) then
+        ll.OwnerSay("[" .. SCRIPT_ID .. "] Inventory changed — reloading notecard.")
+        is_registered = false
+        notecard_loaded = false
+        start_notecard_load()
+    end
 end)
 
 --================================================//

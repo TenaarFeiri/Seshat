@@ -224,6 +224,7 @@ The notecard is a human-facing authoring format. At parse time, the loader split
 | `wind_speed` | number | Base wind speed (kph) |
 | `wind_dir` | cardinal or degrees | Prevailing direction |
 | `wind_variability` | 0-1 | How much wind fluctuates within this state |
+| `sea_humidity_cap` | number | Optional. Maximum humidity (%) the maritime influence can push this state to. Without this, sea breeze can boost humidity up to 100%. Set lower for dry-season states. |
 | `precipitation` | 0-1 or mm/hr | Rain intensity |
 | `dust` | 0-100 | Aerosol/dust load |
 | `visibility` | km | Horizontal visibility |

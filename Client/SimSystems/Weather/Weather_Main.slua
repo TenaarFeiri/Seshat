@@ -47,6 +47,7 @@ local OP = {
     ADMIN_DUMP   = 11,  -- Admin: dump state to owner chat (Main → Grid)
     ADMIN_DEBUG  = 12,  -- Admin: toggle debug mode (Main → Grid)
     BEACON       = 13,  -- Main → all grids: discovery broadcast with processor key
+    ADMIN_HISTORY = 14, -- Admin: dump transition history to owner chat (Main → Grid)
 }
 
 -- Recipient IDs (from COMMS_PROTOCOL.md recipient table)
@@ -78,6 +79,7 @@ local ADMIN_CMD_UNLOCK = "unlock"
 local ADMIN_CMD_RESET = "reset"
 local ADMIN_CMD_DUMP = "dump"
 local ADMIN_CMD_DEBUG = "debug"
+local ADMIN_CMD_HISTORY = "history"
 
 -- Admin command parameters
 local ADMIN_RESET_PARAM_FULL = "full"
@@ -628,6 +630,10 @@ local function send_admin_to_grid(grid_uuid: string, admin_action: string, data:
         op_id = OP.ADMIN_DUMP
         payload = {}
 
+    elseif admin_action == ADMIN_CMD_HISTORY then
+        op_id = OP.ADMIN_HISTORY
+        payload = {}
+
     elseif admin_action == ADMIN_CMD_DEBUG then
         op_id = OP.ADMIN_DEBUG
         payload = {data}
@@ -744,6 +750,12 @@ local function execute_admin_command(command_string: string, sender_key: string)
             send_admin_to_grid(grid_uuid, ADMIN_CMD_DUMP, nil)
         end
 
+    elseif command == ADMIN_CMD_HISTORY then
+        -- history <grid_uuid|all>
+        for _, grid_uuid in ipairs(target_grids) do
+            send_admin_to_grid(grid_uuid, ADMIN_CMD_HISTORY, nil)
+        end
+
     elseif command == ADMIN_CMD_DEBUG then
         -- debug <grid_uuid|all> <on|off>
         if #tokens < 3 then
@@ -758,7 +770,7 @@ local function execute_admin_command(command_string: string, sender_key: string)
 
     else
         ll.OwnerSay("[" .. SCRIPT_ID .. "] Unknown admin command: " .. command)
-        ll.OwnerSay("  Available: target, force, unlock, reset, dump, debug")
+        ll.OwnerSay("  Available: target, force, unlock, reset, dump, history, debug")
     end
 end
 

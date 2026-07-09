@@ -42,6 +42,7 @@
     temp_diurnal = 4
     temp_phase = 14
     humidity = 67
+    sea_humidity_cap = 75
     pressure = 1015
     wind_speed = 15
     wind_dir = NW
@@ -67,6 +68,7 @@
     temp_diurnal = 3.5
     temp_phase = 14
     humidity = 69
+    sea_humidity_cap = 78
     pressure = 1013
     wind_speed = 18
     wind_dir = NW
@@ -95,6 +97,7 @@
     temp_diurnal = 3
     temp_phase = 14
     humidity = 71
+    sea_humidity_cap = 82
     pressure = 1011
     wind_speed = 22
     wind_dir = NW
@@ -122,6 +125,7 @@
     temp_diurnal = 3.5
     temp_phase = 14
     humidity = 70
+    sea_humidity_cap = 85
     pressure = 1009
     wind_speed = 25
     wind_dir = NW
@@ -155,6 +159,7 @@
     temp_diurnal = 4.5
     temp_phase = 14
     humidity = 67
+    sea_humidity_cap = 73
     pressure = 1017
     wind_speed = 18
     wind_dir = NW
@@ -183,6 +188,7 @@
     temp_diurnal = 4
     temp_phase = 14
     humidity = 69
+    sea_humidity_cap = 76
     pressure = 1015
     wind_speed = 20
     wind_dir = NW
@@ -214,6 +220,7 @@
     temp_diurnal = 3.5
     temp_phase = 14
     humidity = 71
+    sea_humidity_cap = 80
     pressure = 1013
     wind_speed = 23
     wind_dir = W
@@ -240,6 +247,7 @@
     temp_diurnal = 3
     temp_phase = 14
     humidity = 73
+    sea_humidity_cap = 85
     pressure = 1011
     wind_speed = 25
     wind_dir = W
@@ -266,6 +274,7 @@
     temp_diurnal = 2.5
     temp_phase = 14
     humidity = 78
+    sea_humidity_cap = 90
     pressure = 1009
     wind_speed = 40
     wind_dir = W
@@ -323,6 +332,7 @@
     temp_diurnal = 3.5
     temp_phase = 14
     humidity = 70
+    sea_humidity_cap = 75
     pressure = 1009
     wind_speed = 15
     wind_dir = NNW
@@ -345,6 +355,7 @@
     temp_diurnal = 2.5
     temp_phase = 14
     humidity = 75
+    sea_humidity_cap = 80
     pressure = 1008
     wind_speed = 10
     wind_dir = NNW
