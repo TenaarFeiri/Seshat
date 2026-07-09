@@ -61,6 +61,9 @@ local LSD_KEY_STATE = "state"
 local LSD_KEY_TRANSITION = "transition"
 local LSD_KEY_PROCESSOR_KEY = "processor_key"  -- Discovered via beacon, not notecard
 
+-- Zone bounding-box fields (defined in the notecard {grid} section)
+local ZONE_FIELDS = { "min_x", "min_y", "min_z", "max_x", "max_y", "max_z" }
+
 -- Season names (ancient Egyptian calendar)
 local SEASON_AKHET = "Akhet"
 local SEASON_PERET = "Peret"
@@ -113,6 +116,7 @@ local poll_timer_handler: any = nil
 local notecard_line_number: number = 0
 local notecard_total_lines: number = 0
 local notecard_query_id: string = ""
+local notecard_linecount_query_id: string = ""  -- Query ID for GetNumberOfNotecardLines (async)
 local current_scope: string = ""  -- "grid", "season:Akhet", etc.
 local current_season: string = ""  -- "Akhet", "Peret", "Shemu"
 local current_state_name: string = ""  -- "Clear Skies", "Khamsin", etc.
@@ -270,7 +274,7 @@ local function parse_notecard_value(value_string: string): any
 end
 
 -- Determine if a line is a scope header: {grid: name} or {season: name}
-local function parse_scope_header(line: string): string, string
+local function parse_scope_header(line: string): (string, string)
     local scope_type, scope_name = string.match(line, "^{%s*(%w+)%s*:%s*(.+)%s*}$")
     if scope_type and scope_name then
         return scope_type, trim_string(scope_name)
@@ -288,7 +292,7 @@ local function parse_state_header(line: string): string
 end
 
 -- Determine if a line is a key=value pair.
-local function parse_key_value(line: string): string, any
+local function parse_key_value(line: string): (string, any)
     local key, value = string.match(line, "^%s*(%w[%w_]*)%s*=%s*(.+)$")
     if key and value then
         return trim_string(key), parse_notecard_value(value)
@@ -360,17 +364,37 @@ local function process_notecard_line(raw_line: string): ()
 end
 
 -- Start loading the notecard from the prim's inventory.
+-- GetNumberOfNotecardLines is async — it returns a query ID, and the actual
+-- line count arrives via a dataserver event. We store the query ID and start
+-- requesting lines only after the count is known.
 local function start_notecard_load(): ()
-    notecard_total_lines = ll.GetNumberOfNotecardLines(NOTECARD_NAME)
-    notecard_line_number = 0
+    notecard_line_number = 1
     current_scope = ""
     current_season = ""
     current_state_name = ""
     current_state_params = {}
     current_grid_config = {}
 
-    -- Request the first line (async — dataserver event will deliver it)
-    notecard_query_id = ll.GetNotecardLine(NOTECARD_NAME, 0)
+    -- Request the line count (async — dataserver event will deliver it)
+    notecard_linecount_query_id = ll.GetNumberOfNotecardLines(NOTECARD_NAME)
+end
+
+-- Handle a dataserver response with the notecard line count.
+local function handle_notecard_linecount(query_id: string, data: string): ()
+    if query_id ~= notecard_linecount_query_id then return end
+    notecard_total_lines = tonumber(data) or 0
+    notecard_linecount_query_id = ""
+
+    if notecard_total_lines > 0 then
+        -- Request the first line (async — dataserver event will deliver it)
+        notecard_query_id = ll.GetNotecardLine(NOTECARD_NAME, 1)
+    else
+        -- Empty notecard — flush and finish
+        flush_current_state()
+        flush_grid_config()
+        notecard_loaded = true
+        ll.OwnerSay("[" .. SCRIPT_ID .. "] WARNING: Notecard '" .. NOTECARD_NAME .. "' is empty")
+    end
 end
 
 -- Handle a dataserver response with a notecard line.
@@ -382,10 +406,10 @@ local function handle_notecard_line_data(query_id: string, data: string): ()
         process_notecard_line(data)
     end
 
-    -- Advance to the next line
+    -- Advance to the next line (1-based index)
     notecard_line_number = notecard_line_number + 1
 
-    if notecard_line_number < notecard_total_lines then
+    if notecard_line_number <= notecard_total_lines then
         -- Request the next line
         notecard_query_id = ll.GetNotecardLine(NOTECARD_NAME, notecard_line_number)
     else
@@ -848,7 +872,7 @@ end
 --=========== Duration Parsing ================--
 
 -- Parse a duration string like "4-9" into min and max hours.
-local function parse_duration(duration_str: string): number, number
+local function parse_duration(duration_str: string): (number, number)
     local min_str, max_str = string.match(duration_str or "", "(%d+)%s*-%s*(%d+)")
     if min_str and max_str then
         return tonumber(min_str) or 1, tonumber(max_str) or 6
@@ -909,7 +933,8 @@ end
 local function send_register(config: any, targets: any): ()
     local envelope: any = {
         o = {OP.REGISTER},
-        f = ll.GetKey() .. ":" .. SCRIPT_ID,
+        f = ll.GetKey(),
+        s = SCRIPT_ID,
         t = {RECIPIENT.MAIN},
         p = {{ll.GetKey(), config, targets}},
     }
@@ -920,7 +945,8 @@ end
 local function send_state_poll(): ()
     local envelope: any = {
         o = {OP.STATE_POLL},
-        f = ll.GetKey() .. ":" .. SCRIPT_ID,
+        f = ll.GetKey(),
+        s = SCRIPT_ID,
         t = {RECIPIENT.MAIN},
         p = {{ll.GetKey()}},
     }
@@ -931,7 +957,8 @@ end
 local function send_target_push(targets: any): ()
     local envelope: any = {
         o = {OP.TARGET_PUSH},
-        f = ll.GetKey() .. ":" .. SCRIPT_ID,
+        f = ll.GetKey(),
+        s = SCRIPT_ID,
         t = {RECIPIENT.MAIN},
         p = {{ll.GetKey(), targets}},
     }
@@ -980,6 +1007,22 @@ end
 
 -- Process a STATE_RESP from the processor.
 -- Updates the grid's runtime state, records pressure, evaluates transitions.
+-- Update the prim's floating text with current weather data (for testing).
+-- ll.SetText has a 255-char limit — keep the format compact.
+local function update_display(state: any): ()
+    local line1: string = tostring(state.current_state or "?") .. " (" .. tostring(state.season or "?") .. ")"
+    local line2: string = "T:" .. string.format("%.1f", state.temp or 0)
+        .. "C  H:" .. tostring(state.humidity or 0)
+        .. "%  P:" .. string.format("%.0f", state.pressure or 0)
+    local line3: string = "Wind:" .. tostring(state.wind_speed or 0)
+        .. " " .. tostring(state.wind_dir or "?")
+        .. "  Dust:" .. tostring(state.dust or 0)
+        .. "  Vis:" .. tostring(state.visibility or 0)
+    local line4: string = "Rain:" .. tostring(state.precipitation or 0)
+    local text: string = line1 .. "\n" .. line2 .. "\n" .. line3 .. "\n" .. line4
+    ll.SetText(text, vector.create(1, 1, 1), 1)
+end
+
 local function handle_state_resp(values: any, evolution: any): ()
     local season: string = get_season_from_sl_date()
 
@@ -1014,6 +1057,7 @@ local function handle_state_resp(values: any, evolution: any): ()
     state.particle = values.particle
     state.last_update = os.time()
     lsd_write_json(LSD_KEY_STATE, state)
+    update_display(state)
 
     -- Bootstrap evaluation on first poll
     if is_first_poll then
@@ -1068,10 +1112,30 @@ end
 
 --============ Boot Sequence ==================--
 
+-- Validate that the config contains a complete zone bounding box.
+-- Returns true if all six zone fields are present and numeric.
+local function validate_zone(config: any): boolean
+    if not config then return false end
+    for _, field in ipairs(ZONE_FIELDS) do
+        local value: any = config[field]
+        if type(value) ~= "number" then
+            ll.OwnerSay("[" .. SCRIPT_ID .. "] ERROR: Missing or non-numeric zone field '" .. field .. "' in config")
+            return false
+        end
+    end
+    return true
+end
+
 -- Register with Main: send config and Clear Skies targets for the current season.
 register_with_main = function(): ()
     local config: any = lsd_read_json(LSD_KEY_CONFIG) or {}
     local season: string = get_season_from_sl_date()
+
+    -- Validate zone bounding box before registering
+    if not validate_zone(config) then
+        ll.OwnerSay("[" .. SCRIPT_ID .. "] ERROR: Cannot register — zone not fully defined in notecard")
+        return
+    end
 
     -- Get Clear Skies state definition for the current season
     local clear_skies: any = get_state_definition(season, "Clear Skies")
@@ -1117,7 +1181,7 @@ end
 local function boot_grid_controller(): ()
     -- Start listening on the comms channel immediately so we can hear
     -- Main's discovery beacon, even before the notecard is loaded.
-    ll.Listen(COMMS_CHANNEL, "", nil, "")
+    ll.Listen(COMMS_CHANNEL, "", "", "")
 
     -- Check if notecard data is already in LSD (from a previous boot)
     local config: any = lsd_read_json(LSD_KEY_CONFIG)
@@ -1312,9 +1376,13 @@ LLEvents:on("listen", function(channel: number, name: string, sender_uuid: strin
     end
 end)
 
--- Dataserver event: handles async notecard line delivery.
+-- Dataserver event: handles async notecard line count and line delivery.
 LLEvents:on("dataserver", function(request_id: string, data: string)
-    handle_notecard_line_data(request_id, data)
+    if request_id == notecard_linecount_query_id and notecard_linecount_query_id ~= "" then
+        handle_notecard_linecount(request_id, data)
+    else
+        handle_notecard_line_data(request_id, data)
+    end
 end)
 
 -- Linkset data event: stub for future use.

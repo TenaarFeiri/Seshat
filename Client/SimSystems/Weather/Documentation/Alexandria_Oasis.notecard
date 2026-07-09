@@ -1,7 +1,7 @@
 # Alexandria Oasis — Weather Model Notecard
 # Grid definition for the oasis/biome setting at Alexandria, Egypt.
 # Climate data sourced from CLIMATE_DATA.md (NOAA, Wikipedia, academic studies).
-# Coordinates are set via the box-tool and stored in LSD, not here.
+# Zone bounding box is defined in the {grid} section below (region coordinates).
 #
 # Seasons follow the ancient Egyptian calendar (3 seasons, no winter):
 #   Akhet (Inundation):  Sept 11 – Jan 9   — flood season, autumn/early winter
@@ -20,7 +20,13 @@
   lat = 31.2
   eep_enabled = true
   nile_adjacent = true
-  processor_key = <processor-object-uuid>
+  sea_direction = N
+  min_x = 0
+  min_y = 0
+  min_z = 0
+  max_x = 256
+  max_y = 256
+  max_z = 300
 
 # ============================================================
 # Akhet — Inundation season (Sept 11 – Jan 9)

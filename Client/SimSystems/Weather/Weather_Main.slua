@@ -291,21 +291,18 @@ end
 
 -- Build a message envelope table.
 -- o: operations array (op IDs)
--- f: from string ("uuid:script_id")
+-- f: from (sender object UUID, raw key — not concatenated)
+-- s: script id string (e.g. "MAIN", "PROC1", "GRID")
 -- t: recipients array (recipient IDs)
 -- p: payloads array (one per op)
-local function build_envelope(ops: {number}, from: string, recipients: {number}, payloads: {any}): any
+local function build_envelope(ops: {number}, from: any, script_id: string, recipients: {number}, payloads: {any}): any
     return {
         o = ops,
         f = from,
+        s = script_id,
         t = recipients,
         p = payloads,
     }
-end
-
--- Build the "from" string for this Main script.
-local function self_from_string(): string
-    return ll.GetKey() .. ":" .. SCRIPT_ID
 end
 
 -- Send a message envelope to a specific grid prim via llRegionSayTo.
@@ -341,7 +338,8 @@ end
 local function broadcast_beacon(): ()
     local envelope: any = {
         o = {OP.BEACON},
-        f = ll.GetKey() .. ":" .. SCRIPT_ID,
+        f = ll.GetKey(),
+        s = SCRIPT_ID,
         t = {RECIPIENT.GRID},
         p = {{ll.GetKey()}},
     }
@@ -379,7 +377,8 @@ end
 local function handle_state_poll(grid_uuid: string): ()
     local envelope: any = build_envelope(
         {OP.STATE_POLL},
-        self_from_string(),
+        ll.GetKey(),
+        SCRIPT_ID,
         {RECIPIENT.PROC1},
         {{grid_uuid}}
     )
@@ -391,7 +390,8 @@ end
 local function handle_state_resp(grid_uuid: string, values: any, evolution: any): ()
     local envelope: any = build_envelope(
         {OP.STATE_RESP},
-        self_from_string(),
+        ll.GetKey(),
+        SCRIPT_ID,
         {RECIPIENT.GRID},
         {{grid_uuid, values, evolution}}
     )
@@ -403,7 +403,8 @@ local function handle_meta_req(method: string, grid_uuid: string, requesting_pro
     pending_meta_requester[grid_uuid] = requesting_proc
     local envelope: any = build_envelope(
         {OP.META_REQ},
-        self_from_string(),
+        ll.GetKey(),
+        SCRIPT_ID,
         {RECIPIENT.GRID},
         {{method, grid_uuid}}
     )
@@ -417,7 +418,8 @@ local function handle_meta_resp(method: string, grid_uuid: string, data: any): (
 
     local envelope: any = build_envelope(
         {OP.META_RESP},
-        self_from_string(),
+        ll.GetKey(),
+        SCRIPT_ID,
         {requesting_proc},
         {{method, grid_uuid, data}}
     )
@@ -468,24 +470,28 @@ local function process_inbound_from_grid(envelope: any): ()
     end
 end
 
--- Determine which proc sent a link message based on the `f` field.
-local function parse_sender_proc(from_string: string): number
-    if string.find(from_string, ":proc1") then
+-- Determine which proc sent a link message based on the `s` (script id) field.
+local function parse_sender_proc(script_id: string): number
+    if script_id == "PROC1" then
         return RECIPIENT.PROC1
-    elseif string.find(from_string, ":proc2") then
+    elseif script_id == "PROC2" then
         return RECIPIENT.PROC2
-    elseif string.find(from_string, ":proc3") then
+    elseif script_id == "PROC3" then
         return RECIPIENT.PROC3
     end
     return RECIPIENT.MAIN
 end
 
 -- Process an inbound message envelope from a processor script (via link message).
+-- Link messages reach ALL scripts in the prim, including Main itself, so we
+-- skip our own relayed messages (identified by s == SCRIPT_ID).
 local function process_inbound_from_proc(envelope: any): ()
+    local script_id: string = envelope.s or ""
+    if script_id == SCRIPT_ID then return end
+
     local ops: {number} = envelope.o or {}
     local payloads: {any} = envelope.p or {}
-    local from_string: string = envelope.f or ""
-    local sender_proc: number = parse_sender_proc(from_string)
+    local sender_proc: number = parse_sender_proc(script_id)
 
     for i, op_id in ipairs(ops) do
         local payload: any = payloads[i] or {}
@@ -633,7 +639,8 @@ local function send_admin_to_grid(grid_uuid: string, admin_action: string, data:
 
     local envelope: any = {
         o = {op_id},
-        f = ll.GetKey() .. ":" .. SCRIPT_ID,
+        f = ll.GetKey(),
+        s = SCRIPT_ID,
         t = {RECIPIENT.GRID},
         p = {payload},
     }
@@ -789,10 +796,10 @@ local function boot_main(): ()
     end
 
     -- Start listening on the comms channel for grid messages
-    ll.Listen(COMMS_CHANNEL, "", nil, "")
+    ll.Listen(COMMS_CHANNEL, "", "", "")
 
     -- Start listening on the admin channel for owner commands
-    ll.Listen(ADMIN_CHANNEL, "", nil, "")
+    ll.Listen(ADMIN_CHANNEL, "", "", "")
 
     -- Broadcast an immediate beacon so any already-running grids can discover us
     broadcast_beacon()

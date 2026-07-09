@@ -77,6 +77,14 @@ local FLOOD_STATE_RISING = "rising"
 local FLOOD_STATE_PEAK = "peak"
 local FLOOD_STATE_RECEDING = "receding"
 
+-- Maritime influence: when wind blows from the sea direction, temperature
+-- is cooled and humidity is boosted. When wind blows from the opposite
+-- direction (continental/desert), temperature is warmed and humidity is
+-- reduced. The effect is proportional to the cosine of the angular
+-- difference between wind direction and sea direction.
+local SEA_TEMP_MODIFIER = 3.0       -- °C at full alignment (from sea)
+local SEA_HUMIDITY_MODIFIER = 10.0  -- percentage points at full alignment
+
 --================================================//
 
 --================== State ==================--
@@ -199,6 +207,28 @@ end
 
 --================================================//
 
+--======== Maritime Influence =================--
+
+-- Compute the maritime influence factor based on wind direction vs. the
+-- direction the sea lies in. Returns a value from -1.0 (wind from opposite
+-- of sea, i.e. continental/desert) to 1.0 (wind directly from sea).
+-- Returns 0 if sea_direction is not configured for this grid.
+local function compute_maritime_influence(wind_dir_degrees: number, sea_direction: any): number
+    if not sea_direction then return 0 end
+
+    local sea_dir_degrees: number = cardinal_to_degrees(sea_direction)
+    local angular_diff: number = wind_dir_degrees - sea_dir_degrees
+
+    -- Normalize to -180..180
+    while angular_diff > 180 do angular_diff = angular_diff - 360 end
+    while angular_diff < -180 do angular_diff = angular_diff + 360 end
+
+    -- Cosine of the angular difference: 1.0 = from sea, -1.0 = from opposite
+    return math.cos(angular_diff * math.pi / 180)
+end
+
+--================================================//
+
 --======== Flood Modifier Application ==========--
 
 -- Apply flood modifiers to a field value if the grid is Nile-adjacent.
@@ -284,6 +314,18 @@ local function evolve_grid_micro(grid_uuid: string): ()
     local current_wind_dir: number = micro_wind_dir.current or 0
     local target_wind_dir: number = cardinal_to_degrees(targets.wind_dir or "N")
     local computed_wind_dir: number = relax_wind_direction(current_wind_dir, target_wind_dir, RELAXATION_RATE)
+
+    -- ===== Maritime influence (wind direction → temperature/humidity bias) =====
+    -- Wind from the sea cools and humidifies; wind from inland heats and dries.
+    local sea_direction: any = meta.sea_direction
+    local maritime: number = compute_maritime_influence(computed_wind_dir, sea_direction)
+    if maritime ~= 0 then
+        computed_temp = computed_temp - maritime * SEA_TEMP_MODIFIER
+        computed_humidity = computed_humidity + maritime * SEA_HUMIDITY_MODIFIER
+        -- Clamp humidity to valid range
+        if computed_humidity < 0 then computed_humidity = 0 end
+        if computed_humidity > 100 then computed_humidity = 100 end
+    end
 
     -- ===== Precipitation (relaxed toward target) =====
     local current_precipitation: number = micro_precipitation.current or targets.precipitation or 0

@@ -63,9 +63,9 @@ Transition:    Grid → Main → Proc (new target parameters for next evolution 
 
 ### Definition
 
-Grids are defined by a **box-tool** that measures a prim's position and dimensions and writes the resulting grid definition (corner coordinates + altitude band) into the grid prim's LSD. The box-tool is a one-time measurement instrument — rez it, size it, touch it, derez it. The grid definition persists in LSD.
+Grids are defined by a **bounding box** specified directly in the weather model notecard. The `{grid}` section of the notecard contains six fields that define the grid's zone of influence in region coordinates: `min_x`, `min_y`, `min_z` (minimum altitude), `max_x`, `max_y`, `max_z` (maximum altitude). In practice this is typically `0, 0, 0, 256, 256, <altitude>` to cover the entire sim horizontally with a vertical band, but narrower boxes allow separate biomes in the same region. The grid controller validates that all six fields are present and numeric before registering with Main.
 
-Grids register with the orchestrator by UUID and name. The orchestrator assigns each grid to a processor.
+Grids register with the orchestrator by UUID. The orchestrator assigns each grid to a processor.
 
 ### Multi-grid support
 
@@ -135,9 +135,14 @@ The notecard is a human-facing authoring format. At parse time, the loader split
   climate = mediterranean_arid
   lat = 31.2
   eep_enabled = true
-  eep_experience = <experience-uuid>
   nile_adjacent = true
-  # coordinates set via box-tool, stored in LSD, not here
+  sea_direction = N
+  min_x = 0
+  min_y = 0
+  min_z = 0
+  max_x = 256
+  max_y = 256
+  max_z = 300
 
 # Seasonal context. Ancient Egyptian calendar: Akhet, Peret, Shemu.
 {season: Akhet}
@@ -242,8 +247,10 @@ The notecard is a human-facing authoring format. At parse time, the loader split
 | `climate` | string | Climate regime identifier |
 | `lat` | number | Simulated latitude |
 | `eep_enabled` | bool | Whether this grid uses Experience-based EEP |
-| `eep_experience` | UUID | Which Experience to apply EEP through |
 | `nile_adjacent` | bool | Whether this grid is close enough to the Nile to be affected by flood state |
+| `sea_direction` | cardinal | Direction the sea/maritime influence lies (e.g. `N` for Alexandria). Wind from this direction cools temperature and boosts humidity; wind from the opposite direction warms and dries. Omit for landlocked grids. |
+| `min_x`/`min_y`/`min_z` | number | Zone bounding box minimum corner (region coordinates; `min_z` = min altitude) |
+| `max_x`/`max_y`/`max_z` | number | Zone bounding box maximum corner (region coordinates; `max_z` = max altitude) |
 
 ## Simulation model
 
@@ -349,7 +356,7 @@ For example, a khamsin is a divergent path from Clear Skies or Partly Cloudy, tr
 
 Weather states may optionally specify an EEP preset, applied via Experience permissions. Enforcement is automatic: only avatars wearing an object belonging to the Experience receive the EEP override; non-members see the region default.
 
-**v1 scope: data scaffolding only.** The notecard format and LSD storage include `eep_preset`, `eep_enabled`, and `eep_experience` fields so that state definitions carry the data forward. The actual EEP application functions (`llSetEnvironment` / `llReplaceEnvironment` family) are deferred to a later iteration. The grid controller should read the `eep_preset` field from the current state and store it in its runtime state, but does not need to apply it in v1.
+**v1 scope: data scaffolding only.** The notecard format and LSD storage include `eep_preset` and `eep_enabled` fields so that state definitions carry the data forward. The Experience UUID itself is set in the editor (object properties), not the notecard. The actual EEP application functions (`llSetEnvironment` / `llReplaceEnvironment` family) are deferred to a later iteration. The grid controller should read the `eep_preset` field from the current state and store it in its runtime state, but does not need to apply it in v1.
 
 When EEP application is implemented, the sim should fail gracefully on errors (experience not authorized on parcel, permission revoked, etc.) — log and continue with non-EEP weather. Do not let an EEP failure halt the simulation.
 
@@ -469,7 +476,6 @@ The resulting table structure mirrors the notecard's hierarchy:
         climate = "mediterranean_arid",
         lat = 31.2,
         eep_enabled = true,
-        eep_experience = "<experience-uuid>",
         nile_adjacent = true,
     },
     Akhet = {
@@ -517,7 +523,7 @@ Value parsing rules:
 LSD is linkset-specific — one database per prim regardless of link count — so the convention is simple and flat. Keys use `season:weather_state` as the namespace, with JSON values:
 
 ```
-config                         → {biome, climate, lat, eep_enabled, eep_experience}
+config                         → {biome, climate, lat, eep_enabled, nile_adjacent, sea_direction, min_x, min_y, min_z, max_x, max_y, max_z}
 Akhet:Clear Skies              → {temp_base, temp_diurnal, humidity, ...}
 Akhet:Khamsin                  → {temp_base, ..., event: true, ...}
 Peret:Clear Skies              → {...}
@@ -664,7 +670,7 @@ This is per-script — `debug on` said near a grid toggles debug for that grid's
 - **~~Climate data research~~**: Done. See CLIMATE_DATA.md and Alexandria_Oasis.notecard.
 - **~~Nile flood calendar mapping~~**: Resolved. Day-of-year ranges defined in SIMULATION_MATHS.md section 4.
 - **~~State transition logic~~**: Resolved. Staged progression with time-windowed pressure trends. See SIMULATION_MATHS.md section 6.
-- **EEP application specifics**: Deferred to post-v1. Data scaffolding is in place (eep_preset, eep_enabled, eep_experience fields). When implemented: verify the exact SLua API (`llSetEnvironment` / `llReplaceEnvironment` family), confirm permission model, implement graceful failure on permission errors.
+- **EEP application specifics**: Deferred to post-v1. Data scaffolding is in place (eep_preset, eep_enabled fields; Experience UUID set in editor, not notecard). When implemented: verify the exact SLua API (`llSetEnvironment` / `llReplaceEnvironment` family), confirm permission model, implement graceful failure on permission errors.
 - **Particle application specifics**: Deferred to post-v1. Data scaffolding in place (`particle` field). When implemented: determine `llLinkParticleSystem` vs `llParticleSystem` approach, define particle preset format.
 - **Comms channel security**: The private channel for processor/grid/orchestrator communication needs a derivation scheme (from experience ID? shared secret in notecard?) that prevents non-system objects from listening.
 - **LSD per-key value size limit**: Confirm the exact per-key value size cap for Linkset Data. Weather state JSON values are small (~200-300 bytes), so this is unlikely to be a problem, but the limit should be verified before committing to the storage layout.

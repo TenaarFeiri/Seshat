@@ -241,7 +241,8 @@ local function handle_state_poll(grid_uuid: string): ()
 
     local envelope: any = {
         o = {OP.STATE_RESP},
-        f = ll.GetKey() .. ":" .. SCRIPT_ID,
+        f = ll.GetKey(),
+        s = SCRIPT_ID,
         t = {RECIPIENT.MAIN},
         p = {{response.grid_uuid, response.values, response.evolution}},
     }

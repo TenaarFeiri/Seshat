@@ -4,21 +4,25 @@ Rough sketch. See DESIGN.md for the architecture this protocol serves.
 
 ## Envelope
 
-Every message is a JSON object with four keys:
+Every message is a JSON object with five keys:
 
 ```json
 {
   "o": [1, 2],
-  "f": "object_uuid:script_name",
+  "f": "object_uuid",
+  "s": "script_id",
   "t": [1, 2],
   "p": [payload1, payload2]
 }
 ```
 
+`f` and `s` are split into separate keys because UUID is its own data type in SLua and cannot be typecast to string, so the two cannot be concatenated into a single `"uuid:script_id"` string. `f` carries the raw UUID value (which JSON-encodes to its string form); `s` carries the script id string.
+
 ### Keys
 
 - **`o`** — operations. Array of integers, each mapping to an operation via the op table (see below). This is the source of truth for the message: the number of entries in `o` determines the expected length of `t` and `p`. If any array's length does not match `o`, the message is malformed and discarded entirely.
-- **`f`** — from. Sender identifier, typically `object_uuid:script_name`.
+- **`f`** — from. Sender's object UUID (the prim's key). A raw UUID value, not concatenated with anything.
+- **`s`** — script. Sender's script id string (e.g., `"MAIN"`, `"PROC1"`, `"PROC2"`, `"PROC3"`, `"GRID"`). Identifies which script inside the sender prim authored the message. Together `f` + `s` identify the sender the way the old single `f` string did.
 - **`t`** — to. Array of recipient integers, mapped via the recipient table (see below). Order matches `o`. Main is the routing entrypoint and delegates based on the operations array. If `main` (int 1) appears as a recipient, Main performs that op's internal function itself.
 - **`p`** — payload. Array of payloads, one per operation. Order matches `o`. Each payload is a JSON array of the form `[method?, data...]` where `method` is an optional string that names a sub-handler inside the op (e.g., `"full"`, `"delta"`, `"config"`), and `data` is a positional array of values whose layout is fixed per op. If `p[1]` is a string, it is the method and data starts at `p[2]`. If `p[1]` is not a string, there is no method and data starts at `p[1]`. The op ID defines the positional layout — no field names or indices are needed. See "Payload contracts" below.
 
@@ -28,7 +32,7 @@ The receiver validates on receipt:
 
 1. Parse JSON. If parse fails, discard.
 2. Check `o`, `t`, `p` array lengths match. If not, discard.
-3. `f` must be present and non-empty. If not, discard.
+3. `f` and `s` must both be present and non-empty. If not, discard.
 4. Dispatch each op/target/payload triplet in order.
 
 Discarded messages should produce a debug signal (print or counter), not vanish silently. Silent failure is reserved for idempotent re-sends of recognized messages, not for malformed or incomplete ones.
@@ -133,7 +137,8 @@ Example: a `STATE_RESP` bound for grid `abc123`:
 ```json
 {
   "o": [4],
-  "f": "proc_uuid:proc1",
+  "f": "proc_uuid",
+  "s": "PROC1",
   "t": [5],
   "p": [["abc123", {"temp": 24, "humidity": 35, "pressure": 1012, "wind_speed": 15, "wind_dir": 315, "precipitation": 5, "dust": 0, "visibility": 50}, {"pressure_trend": -0.08, "pressure_driver_offset": -2.3}]]
 }
@@ -156,7 +161,7 @@ p = [grid_uuid, config, targets]
 | Position | Name | Type | Description |
 |---|---|---|---|
 | 1 | grid_uuid | string | Object UUID of the grid prim |
-| 2 | config | object | Grid metadata: `{biome, climate, lat, eep_enabled, eep_experience, nile_adjacent}` |
+| 2 | config | object | Grid metadata: `{biome, climate, lat, eep_enabled, nile_adjacent, sea_direction, min_x, min_y, min_z, max_x, max_y, max_z}`. `sea_direction` is the cardinal direction of maritime influence (optional, omit for landlocked). The `min_*`/`max_*` fields define the grid's zone bounding box in region coordinates. |
 | 3 | targets | object | Initial target parameters (Clear Skies for current season): `{temp_base, temp_diurnal, temp_phase, humidity, pressure, wind_speed, wind_dir, wind_variability, precipitation, dust, visibility, eep_preset, particle, flood_*}` |
 
 No method — this is the only REGISTER variant.
@@ -230,7 +235,7 @@ p = [method, grid_uuid, data]
 |---|---|---|---|
 | 1 | method | string | Echoes the method from the matching META_REQ: `"config"` or `"states"` |
 | 2 | grid_uuid | string | Object UUID of the grid prim |
-| 3 | data | object | The requested data. For `"config"`: `{biome, climate, lat, eep_enabled, eep_experience, nile_adjacent}`. For `"states"`: a table of state definitions keyed by state name. |
+| 3 | data | object | The requested data. For `"config"`: `{biome, climate, lat, eep_enabled, nile_adjacent, sea_direction, min_x, min_y, min_z, max_x, max_y, max_z}`. For `"states"`: a table of state definitions keyed by state name. |
 
 #### TARGET_PUSH (7) — Grid → Main → Proc1/Proc2
 
@@ -253,7 +258,8 @@ Main writes `targets` to `<grid_uuid>:targets` in LSD. Proc1 and Proc2 pick up t
 -- Building a STATE_POLL message
 local msg = {
     o = {3},                              -- STATE_POLL
-    f = my_uuid .. ":grid",
+    f = ll.GetKey(),                      -- object UUID (raw key, no concatenation)
+    s = SCRIPT_ID,                        -- "GRID"
     t = {1},                              -- Main
     p = { {my_uuid} },                    -- [grid_uuid], no method
 }
@@ -262,7 +268,8 @@ llRegionSayTo(main_uuid, channel, llList2Json(JSON_OBJECT, msg))
 -- Building a TARGET_PUSH message
 local msg = {
     o = {7},                              -- TARGET_PUSH
-    f = my_uuid .. ":grid",
+    f = ll.GetKey(),                      -- object UUID (raw key, no concatenation)
+    s = SCRIPT_ID,                        -- "GRID"
     t = {1},                              -- Main
     p = { {my_uuid, new_targets} },       -- [grid_uuid, targets], no method
 }
@@ -271,7 +278,8 @@ llRegionSayTo(main_uuid, channel, llList2Json(JSON_OBJECT, msg))
 -- Building a META_REQ with method
 local msg = {
     o = {5},                              -- META_REQ
-    f = my_uuid .. ":proc1",
+    f = ll.GetKey(),                      -- object UUID (raw key, no concatenation)
+    s = SCRIPT_ID,                        -- "PROC1"
     t = {1},                              -- Main (relays to grid)
     p = { {"config", grid_uuid} },        -- [method, grid_uuid]
 }
@@ -369,11 +377,13 @@ reset_mode                         → "soft" | "full" | (absent)
                                       completes. Absent = normal boot, no reset in progress.
 
 <grid_uuid>:meta                   → {"biome": "desert_coast", "climate": "mediterranean_arid",
-                                      "lat": 31.2, "eep_enabled": true, "eep_experience": "<uuid>",
-                                      "nile_adjacent": true}
+                                      "lat": 31.2, "eep_enabled": true,
+                                      "nile_adjacent": true, "sea_direction": "N",
+                                      "min_x": 0, "min_y": 0, "min_z": 0,
+                                      "max_x": 256, "max_y": 256, "max_z": 300}
                                       Writer: Main (scaffolded on registration, filled from grid via META_REQ/META_RESP)
                                       Readers: Proc1, Proc2, Proc3
-                                      Grid metadata. Populated on-demand if missing.
+                                      Grid metadata including zone bounding box. Populated on-demand if missing.
 
 <grid_uuid>:targets                → {"temp_base": 24, "temp_diurnal": 8, "temp_phase": 14,
                                       "humidity": 35, "pressure": 1015, "wind_speed": 5,
@@ -479,10 +489,14 @@ Each grid prim has its own 128 KB LSD, independent of the processor. This holds 
 
 ```
 config                             → {"biome": "desert_coast", "climate": "mediterranean_arid",
-                                      "lat": 31.2, "eep_enabled": true, "eep_experience": "<uuid>",
-                                      "nile_adjacent": true}
+                                      "lat": 31.2, "eep_enabled": true,
+                                      "nile_adjacent": true, "sea_direction": "N",
+                                      "min_x": 0, "min_y": 0, "min_z": 0,
+                                      "max_x": 256, "max_y": 256, "max_z": 300}
                                       Writer: notecard loader (once, on first boot)
                                       Readers: grid controller script, sent to processor via META_RESP
+                                      The min_*/max_* fields define the grid's zone bounding box
+                                      in region coordinates. min_z/max_z are the altitude band.
 
 Akhet:Clear Skies                  → {"temp_base": 24, "temp_diurnal": 4, "temp_phase": 14,
                                       "humidity": 67, "pressure": 1015, "wind_speed": 15,
