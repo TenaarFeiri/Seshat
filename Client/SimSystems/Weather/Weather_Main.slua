@@ -1,3 +1,4 @@
+--!strict
 --
 -- Main script for the Seshat weather system. It conducts surrounding scripts and serves as primary controller for the system,
 -- incl. managing reboots, collating data, and so on.
@@ -39,58 +40,12 @@ local function api_exists(callback_name: string): boolean
     return API and API.callbacks and API.callbacks[callback_name] ~= nil
 end
 
-local function parse_link_message_to_table(link_int: number, link_message: string): (table | boolean), (string | nil)
-    -- Decode from JSON (always flat arrays)
-    local success, data = pcall(lljson.decode, link_message)
-
-    -- Check if decoding was successful
+local function unpack_json(json_string: string): table
+    local success, unpacked_table = pcall(lljson.decode, json_string)
     if not success then
-        print("Failed to decode JSON: " .. data .. " | " .. link_int .. " | " .. link_message)
-        return false, nil
-    elseif not data["type"] or type(data["type"]) ~= "string" then
-        return false, nil
+        return {}
     end
-
-    -- For us?
-    if not data["to"] or data["to"] ~= SCRIPT_ID then -- Case sensitive.
-        -- Probably not for us.
-        return false, nil
-    end
-    
-    -- Link messages always return a table with a structure map so we can
-    -- automate reading and processing.
-    if not data["struct"] or type(data["struct"]) ~= "table" then
-        return false, nil
-    end
-
-    -- Struct contains every key and subkey in the table.
-    -- Table could be multidimensional, so we need to handle that.
-    local struct = data["struct"]
-
-    -- Struct could look like this:
-    -- {
-    --     1: {
-    --         "event": "SYSTEM_REBOOT",
-    --         "params": something
-    --     },
-    --     2: true
-    -- }
-    return struct, data["type"]
-end
-
-local function process_struct(struct: table)
-    for key, value in pairs(struct) do
-        if type(value) == "table" then
-            -- Check if this table contains an event
-            if value.event and api_exists(value.event) then
-                local params = value.params or {}
-                API.callbacks[value.event](unpack(params))
-            else
-                -- Recursively process nested tables
-                process_struct(value)
-            end
-        end
-    end
+    return unpacked_table
 end
 
 --=============== System ===============--
@@ -139,5 +94,20 @@ API = {
             -- Handle some call
             print("Some call")
             return end,
+        TestWrite = function(k, v)
+            return write(k, v)
+        end,
+        TestRead = function(k)
+            return read(k)
+        end,
     }
 }
+
+local w = API.callbacks.TestWrite("testKey", "testValue")
+local r = if w then API.callbacks.TestRead("testKeey") else false
+
+if r then
+    print(r)
+else
+    print("Not found.")
+end

@@ -1,0 +1,383 @@
+# Alexandria Oasis — Weather Model Notecard
+# Grid definition for the oasis/biome setting at Alexandria, Egypt.
+# Climate data sourced from CLIMATE_DATA.md (NOAA, Wikipedia, academic studies).
+# Coordinates are set via the box-tool and stored in LSD, not here.
+#
+# Progression graph: states advance through stages (Clear → Partly Cloudy →
+# Cloudy → Rain/Storm) based on sustained pressure/humidity trends from the
+# background pressure driver. Events (Khamsin, Storm) are divergent paths
+# triggered by rapid pressure drops. All events regress to the nearest
+# normal state when their duration expires.
+
+{grid: oasis}
+  biome = desert_coast
+  climate = mediterranean_arid
+  lat = 31.2
+  eep_enabled = true
+  eep_experience = <experience-uuid>
+  nile_adjacent = true
+
+# ============================================================
+# Spring — Mediterranean season (Mar/Apr/May)
+# Overlaps with late Akhet (receding flood) and early Peret
+# Progression: Clear → Partly Cloudy → Cloudy → Light Rain
+# Divergent: Khamsin (from Clear or Partly Cloudy)
+# ============================================================
+
+{season: Spring/Akhet}
+
+  [Clear Skies]
+    temp_base = 19
+    temp_diurnal = 4.5
+    temp_phase = 14
+    humidity = 66
+    pressure = 1014
+    wind_speed = 15
+    wind_dir = NW
+    wind_variability = 0.3
+    precipitation = 3
+    dust = 0
+    visibility = 50
+    weight = 10
+    duration = 4-9
+    eep_preset = Clear_Spring_Day
+    particle = none
+    progresses_to = Partly Cloudy
+    diverges_to = Khamsin
+    # Nile flood modifiers (receding during early spring, low by late spring)
+    flood_receding_humidity = +8
+    flood_low_dust = +10
+
+  [Partly Cloudy]
+    temp_base = 18
+    temp_diurnal = 4
+    temp_phase = 14
+    humidity = 68
+    pressure = 1012
+    wind_speed = 17
+    wind_dir = NW
+    wind_variability = 0.35
+    precipitation = 2
+    dust = 0
+    visibility = 40
+    weight = 7
+    duration = 3-7
+    eep_preset = Partly_Cloudy_Spring
+    particle = none
+    progresses_to = Cloudy
+    regresses_to = Clear Skies
+    diverges_to = Khamsin
+    flood_receding_humidity = +6
+    flood_low_dust = +5
+
+  [Cloudy]
+    temp_base = 17
+    temp_diurnal = 3.5
+    temp_phase = 14
+    humidity = 70
+    pressure = 1010
+    wind_speed = 20
+    wind_dir = NW
+    wind_variability = 0.4
+    precipitation = 5
+    dust = 0
+    visibility = 25
+    weight = 5
+    duration = 3-6
+    eep_preset = Overcast_Spring
+    particle = none
+    progresses_to = Light Rain
+    regresses_to = Partly Cloudy
+    flood_receding_humidity = +5
+
+  [Light Rain]
+    temp_base = 16
+    temp_diurnal = 3.5
+    temp_phase = 14
+    humidity = 72
+    pressure = 1008
+    wind_speed = 20
+    wind_dir = NW
+    wind_variability = 0.4
+    precipitation = 15
+    dust = 0
+    visibility = 20
+    weight = 4
+    duration = 3-6
+    eep_preset = Rainy_Spring
+    particle = light_rain
+    regresses_to = Cloudy
+    flood_receding_humidity = +5
+
+  [Khamsin]
+    temp_base = 38
+    temp_diurnal = 3
+    temp_phase = 14
+    humidity = 8
+    pressure = 1006
+    wind_speed = 80
+    wind_dir = S
+    wind_variability = 0.7
+    precipitation = 0
+    dust = 85
+    visibility = 3
+    weight = 2
+    duration = 6-24
+    event = true
+    eep_preset = Khamsin_Dust_Storm
+    particle = dust_storm_heavy
+    # Events regress to nearest normal state when duration expires
+    regresses_to = Clear Skies
+    # Khamsin occurs during low/receding flood — dust from exposed riverbed
+    flood_low_dust = +10
+
+# ============================================================
+# Summer — Mediterranean season (Jun/Jul/Aug)
+# Aligns with Shemu (harvest / low water)
+# Progression: Clear → Hazy Heat (limited tree — summer is stable)
+# No rain or storm states — summer is effectively rainless
+# ============================================================
+
+{season: Summer/Shemu}
+
+  [Clear Skies]
+    temp_base = 27
+    temp_diurnal = 3.5
+    temp_phase = 14
+    humidity = 70
+    pressure = 1009
+    wind_speed = 15
+    wind_dir = NNW
+    wind_variability = 0.2
+    precipitation = 0
+    dust = 0
+    visibility = 50
+    weight = 10
+    duration = 7-14
+    eep_preset = Clear_Summer_Day
+    particle = none
+    progresses_to = Hazy Heat
+    # Shemu = low flood. Exposed riverbed silt increases dust availability.
+    flood_low_dust = +10
+
+  [Hazy Heat]
+    temp_base = 30
+    temp_diurnal = 2.5
+    temp_phase = 14
+    humidity = 75
+    pressure = 1008
+    wind_speed = 10
+    wind_dir = NNW
+    wind_variability = 0.2
+    precipitation = 0
+    dust = 15
+    visibility = 15
+    weight = 5
+    duration = 3-7
+    eep_preset = Hazy_Summer
+    particle = light_haze
+    regresses_to = Clear Skies
+    flood_low_dust = +5
+
+# ============================================================
+# Autumn — Mediterranean season (Sep/Oct/Nov)
+# Overlaps with early Akhet (rising/peak flood) and late Shemu
+# Progression: Clear → Partly Cloudy → Cloudy → Early Storms
+# ============================================================
+
+{season: Autumn/Akhet}
+
+  [Clear Skies]
+    temp_base = 24
+    temp_diurnal = 4
+    temp_phase = 14
+    humidity = 67
+    pressure = 1015
+    wind_speed = 15
+    wind_dir = NW
+    wind_variability = 0.3
+    precipitation = 5
+    dust = 0
+    visibility = 50
+    weight = 8
+    duration = 5-10
+    eep_preset = Clear_Autumn_Day
+    particle = none
+    progresses_to = Partly Cloudy
+    # Autumn brings the flood — rising early, peak by Oct
+    flood_rising_humidity = +5
+    flood_peak_humidity = +15
+    flood_peak_fog = +0.3
+
+  [Partly Cloudy]
+    temp_base = 23
+    temp_diurnal = 3.5
+    temp_phase = 14
+    humidity = 69
+    pressure = 1013
+    wind_speed = 18
+    wind_dir = NW
+    wind_variability = 0.35
+    precipitation = 5
+    dust = 0
+    visibility = 40
+    weight = 6
+    duration = 4-8
+    eep_preset = Partly_Cloudy_Autumn
+    particle = none
+    progresses_to = Cloudy
+    regresses_to = Clear Skies
+    flood_rising_humidity = +4
+    flood_peak_humidity = +12
+    flood_peak_fog = +0.2
+
+  [Cloudy]
+    temp_base = 22
+    temp_diurnal = 3
+    temp_phase = 14
+    humidity = 71
+    pressure = 1011
+    wind_speed = 22
+    wind_dir = NW
+    wind_variability = 0.45
+    precipitation = 10
+    dust = 0
+    visibility = 25
+    weight = 4
+    duration = 3-6
+    eep_preset = Overcast_Autumn
+    particle = none
+    progresses_to = Early Storms
+    regresses_to = Partly Cloudy
+    flood_peak_humidity = +10
+    flood_peak_fog = +0.2
+
+  [Early Storms]
+    temp_base = 21
+    temp_diurnal = 3.5
+    temp_phase = 14
+    humidity = 70
+    pressure = 1009
+    wind_speed = 25
+    wind_dir = NW
+    wind_variability = 0.5
+    precipitation = 20
+    dust = 0
+    visibility = 15
+    weight = 3
+    duration = 2-5
+    eep_preset = Stormy_Autumn
+    particle = moderate_rain
+    regresses_to = Cloudy
+    flood_peak_humidity = +10
+    flood_peak_fog = +0.2
+
+# ============================================================
+# Winter — Mediterranean season (Dec/Jan/Feb)
+# Aligns with Peret (emergence / receding flood)
+# Progression: Clear → Partly Cloudy → Cloudy → Rainy → Storm
+# Storm is a divergent event (rapid pressure drop + high humidity)
+# ============================================================
+
+{season: Winter/Peret}
+
+  [Clear Skies]
+    temp_base = 15
+    temp_diurnal = 4.5
+    temp_phase = 14
+    humidity = 68
+    pressure = 1019
+    wind_speed = 20
+    wind_dir = NW
+    wind_variability = 0.3
+    precipitation = 5
+    dust = 0
+    visibility = 50
+    weight = 8
+    duration = 4-8
+    eep_preset = Clear_Winter_Day
+    particle = none
+    progresses_to = Partly Cloudy
+    # Flood receding through winter
+    flood_receding_humidity = +8
+
+  [Partly Cloudy]
+    temp_base = 14
+    temp_diurnal = 4
+    temp_phase = 14
+    humidity = 70
+    pressure = 1017
+    wind_speed = 22
+    wind_dir = NW
+    wind_variability = 0.35
+    precipitation = 5
+    dust = 0
+    visibility = 40
+    weight = 6
+    duration = 3-7
+    eep_preset = Partly_Cloudy_Winter
+    particle = none
+    progresses_to = Cloudy
+    regresses_to = Clear Skies
+    flood_receding_humidity = +6
+
+  [Cloudy]
+    temp_base = 13
+    temp_diurnal = 3.5
+    temp_phase = 14
+    humidity = 72
+    pressure = 1015
+    wind_speed = 24
+    wind_dir = W
+    wind_variability = 0.4
+    precipitation = 10
+    dust = 0
+    visibility = 25
+    weight = 5
+    duration = 3-6
+    eep_preset = Overcast_Winter
+    particle = none
+    progresses_to = Rainy
+    regresses_to = Partly Cloudy
+    flood_receding_humidity = +5
+
+  [Rainy]
+    temp_base = 12
+    temp_diurnal = 3
+    temp_phase = 14
+    humidity = 75
+    pressure = 1013
+    wind_speed = 25
+    wind_dir = W
+    wind_variability = 0.4
+    precipitation = 30
+    dust = 0
+    visibility = 10
+    weight = 4
+    duration = 3-6
+    eep_preset = Rainy_Winter
+    particle = moderate_rain
+    progresses_to = Storm
+    regresses_to = Cloudy
+    flood_receding_humidity = +5
+
+  [Storm]
+    temp_base = 11
+    temp_diurnal = 2.5
+    temp_phase = 14
+    humidity = 78
+    pressure = 1011
+    wind_speed = 40
+    wind_dir = W
+    wind_variability = 0.6
+    precipitation = 50
+    dust = 0
+    visibility = 5
+    weight = 2
+    duration = 2-4
+    event = true
+    eep_preset = Winter_Storm
+    particle = heavy_rain
+    # Storm is an event — regress to Rainy when duration expires
+    regresses_to = Rainy
+    flood_receding_humidity = +3
