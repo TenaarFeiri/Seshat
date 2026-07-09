@@ -1,0 +1,370 @@
+--!strict
+--
+-- Proc2 (Auxiliary/Micro) script for the Seshat Weather System.
+-- Handles micro-level compute: evolves all computed weather values (temperature,
+-- humidity, pressure, wind, dust, visibility, precipitation) toward grid-provided
+-- targets using the relaxation model with stochastic noise.
+--
+-- Proc2 round-robins through the grids registry on a 15-second cadence, evolving
+-- one grid per cycle. It reads targets from <grid_uuid>:targets, reads driver
+-- data from drivers:* (written by Proc3), and writes computed values to
+-- <grid_uuid>:micro:* keys.
+--
+-- See Documentation/DESIGN.md and Documentation/SIMULATION_MATHS.md
+-- for architecture and math details.
+--
+
+--================== Constants ==================--
+
+local SCRIPT_ID = "PROC2"
+
+-- Compute cadence: how often Proc2 processes one grid in the round-robin (seconds)
+local COMPUTE_INTERVAL_SECONDS = 15
+
+-- Link message constants (must match Main)
+local LINK_MSG_MARKER = 7777
+
+-- Operation IDs (from COMMS_PROTOCOL.md op table)
+local OP = {
+    REGISTER     = 1,
+    UNREGISTER   = 2,
+    STATE_POLL   = 3,
+    STATE_RESP   = 4,
+    META_REQ     = 5,
+    META_RESP    = 6,
+    TARGET_PUSH  = 7,
+    ADMIN_TARGET = 8,
+    ADMIN_FORCE  = 9,
+    ADMIN_UNLOCK = 10,
+    ADMIN_DUMP   = 11,
+    ADMIN_DEBUG  = 12,
+}
+
+-- Recipient IDs (from COMMS_PROTOCOL.md recipient table)
+local RECIPIENT = {
+    MAIN  = 1,
+    PROC1 = 2,
+    PROC2 = 3,
+    PROC3 = 4,
+    GRID  = 5,
+}
+
+-- LSD key names
+local LSD_KEY_GRIDS = "grids"
+local LSD_KEY_DRIVERS_FLOOD_STATE = "drivers:flood_state"
+local LSD_KEY_DRIVERS_PRESSURE = "drivers:pressure"
+
+-- Relaxation model parameters (from SIMULATION_MATHS.md section 2)
+local RELAXATION_RATE = 0.1        -- How fast values drift toward targets (0-1 per cycle)
+local NOISE_SCALE_DEFAULT = 0.05   -- Default stochastic perturbation scale
+
+-- Diurnal temperature parameters (from SIMULATION_MATHS.md section 3)
+local TWO_PI = 2 * math.pi
+local HOURS_PER_DAY = 24
+local SECONDS_PER_HOUR = 3600
+
+-- Wind direction: cardinal to degrees mapping (from SIMULATION_MATHS.md section 3)
+local CARDINAL_TO_DEGREES: { [string]: number } = {
+    N = 0, NNE = 22.5, NE = 45, ENE = 67.5,
+    E = 90, ESE = 112.5, SE = 135, SSE = 157.5,
+    S = 180, SSW = 202.5, SW = 225, WSW = 247.5,
+    W = 270, WNW = 292.5, NW = 315, NNW = 337.5,
+}
+
+-- Flood state values (must match Proc3)
+local FLOOD_STATE_LOW = "low"
+local FLOOD_STATE_RISING = "rising"
+local FLOOD_STATE_PEAK = "peak"
+local FLOOD_STATE_RECEDING = "receding"
+
+--================================================//
+
+--================== State ==================--
+
+-- Round-robin index: which grid in the registry we process next
+local round_robin_index: number = 1
+
+--================================================//
+
+--================= Utilities =================--
+
+local function lsd_read(key_name: string): string
+    local value: string = ll.LinksetDataRead(key_name) or ""
+    return value
+end
+
+local function lsd_write(key_name: string, value: string): boolean
+    local result: number = ll.LinksetDataWrite(key_name, value)
+    return result == 0
+end
+
+local function lsd_read_json(key_name: string): any
+    local raw: string = lsd_read(key_name)
+    if raw == "" then
+        return nil
+    end
+    local success, decoded = pcall(lljson.decode, raw)
+    if not success then
+        return nil
+    end
+    return decoded
+end
+
+local function lsd_write_json(key_name: string, value: any): boolean
+    local encoded: string = lljson.encode(value)
+    return lsd_write(key_name, encoded)
+end
+
+-- Get the list of registered grid UUIDs from LSD.
+local function get_registered_grids(): {string}
+    local raw: string = lsd_read(LSD_KEY_GRIDS)
+    if raw == "" then
+        return {}
+    end
+    local grids: {string} = {}
+    for uuid in string.gmatch(raw, "[^,]+") do
+        table.insert(grids, uuid)
+    end
+    return grids
+end
+
+--================================================//
+
+--=========== Relaxation & Noise ==============--
+
+-- Evolve a value toward its target using the relaxation model.
+-- new_value = current + (target - current) * rate + noise
+local function relax_value(current_value: number, target_value: number, rate: number, noise_scale: number): number
+    local delta: number = (target_value - current_value) * rate
+    local noise: number = (math.random() - 0.5) * 2 * noise_scale * math.abs(target_value - current_value + 1)
+    return current_value + delta + noise
+end
+
+--================================================//
+
+--========= Diurnal Temperature ===============--
+
+-- Compute the diurnal temperature for a grid based on sun position.
+-- temp = temp_base + temp_diurnal * sin(sun_angle - phase_offset)
+-- The sun angle is derived from the current SL time of day.
+local function compute_diurnal_temperature(temp_base: number, temp_diurnal: number, temp_phase: number): number
+    -- Get the current time of day in hours (0-24)
+    local current_time_string: string = os.date("%H:%M:%S")
+    local current_hour: number = tonumber(string.sub(current_time_string, 1, 2)) or 12
+    local current_minute: number = tonumber(string.sub(current_time_string, 4, 5)) or 0
+    local time_of_day_hours: number = current_hour + current_minute / 60
+
+    -- Convert to angular position (0 at midnight, pi at noon)
+    local sun_angle: number = (time_of_day_hours / HOURS_PER_DAY) * TWO_PI
+
+    -- Phase offset: temp_phase is the hour of peak temperature (default ~14:00)
+    local phase_offset: number = (temp_phase / HOURS_PER_DAY) * TWO_PI
+
+    -- Temperature follows a sine wave peaking at temp_phase
+    local temperature: number = temp_base + temp_diurnal * math.sin(sun_angle - phase_offset + math.pi / 2)
+
+    return temperature
+end
+
+--================================================//
+
+--======== Wind Direction Interpolation =======--
+
+-- Convert a cardinal direction string to degrees.
+local function cardinal_to_degrees(cardinal: string): number
+    return CARDINAL_TO_DEGREES[cardinal] or tonumber(cardinal) or 0
+end
+
+-- Evolve wind direction toward target, handling the 0-360 wraparound.
+local function relax_wind_direction(current_degrees: number, target_degrees: number, rate: number): number
+    -- Find the shortest angular path between current and target
+    local delta: number = target_degrees - current_degrees
+    if delta > 180 then
+        delta = delta - 360
+    elseif delta < -180 then
+        delta = delta + 360
+    end
+
+    local new_direction: number = current_degrees + delta * rate
+
+    -- Wrap to 0-360 range
+    if new_direction < 0 then
+        new_direction = new_direction + 360
+    elseif new_direction >= 360 then
+        new_direction = new_direction - 360
+    end
+
+    return new_direction
+end
+
+--================================================//
+
+--======== Flood Modifier Application ==========--
+
+-- Apply flood modifiers to a field value if the grid is Nile-adjacent.
+-- The modifier keys in the targets are named flood_<state>_<field>.
+local function apply_flood_modifier(field_name: string, field_value: number, targets: any, flood_state: string, nile_adjacent: boolean): number
+    if not nile_adjacent then
+        return field_value
+    end
+
+    local modifier_key: string = "flood_" .. flood_state .. "_" .. field_name
+    local modifier: number = targets[modifier_key]
+    if modifier then
+        return field_value + modifier
+    end
+
+    return field_value
+end
+
+-- Read the current flood state from the drivers LSD.
+local function get_current_flood_state(): string
+    local flood_data: any = lsd_read_json(LSD_KEY_DRIVERS_FLOOD_STATE) or {}
+    return flood_data.state or FLOOD_STATE_LOW
+end
+
+--================================================//
+
+--============ Micro Evolution =================--
+
+-- Evolve all micro values for a single grid.
+-- This is the core compute function — reads targets, reads drivers, applies
+-- relaxation + noise + diurnal + flood modifiers + pressure driver, writes results.
+local function evolve_grid_micro(grid_uuid: string): ()
+    local targets: any = lsd_read_json(grid_uuid .. ":targets") or {}
+    local meta: any = lsd_read_json(grid_uuid .. ":meta") or {}
+
+    -- Read current micro values (or initialize from targets if first cycle)
+    local micro_temp: any = lsd_read_json(grid_uuid .. ":micro:temp") or {}
+    local micro_humidity: any = lsd_read_json(grid_uuid .. ":micro:humidity") or {}
+    local micro_pressure: any = lsd_read_json(grid_uuid .. ":micro:pressure") or {}
+    local micro_wind_speed: any = lsd_read_json(grid_uuid .. ":micro:wind_speed") or {}
+    local micro_wind_dir: any = lsd_read_json(grid_uuid .. ":micro:wind_dir") or {}
+    local micro_precipitation: any = lsd_read_json(grid_uuid .. ":micro:precipitation") or {}
+    local micro_dust: any = lsd_read_json(grid_uuid .. ":micro:dust") or {}
+    local micro_visibility: any = lsd_read_json(grid_uuid .. ":micro:visibility") or {}
+
+    -- Read driver data from Proc3
+    local pressure_driver: any = lsd_read_json(LSD_KEY_DRIVERS_PRESSURE) or {}
+    local pressure_driver_offset: number = pressure_driver.offset or 0
+    local flood_state: string = get_current_flood_state()
+    local nile_adjacent: boolean = meta.nile_adjacent or false
+
+    -- Read variability from targets for noise scaling
+    local wind_variability: number = targets.wind_variability or 0.3
+
+    -- ===== Temperature (diurnal, not relaxed — computed directly) =====
+    local temp_base: number = targets.temp_base or 20
+    local temp_diurnal: number = targets.temp_diurnal or 5
+    local temp_phase: number = targets.temp_phase or 14
+    local computed_temp: number = compute_diurnal_temperature(temp_base, temp_diurnal, temp_phase)
+
+    -- Apply flood modifier to temperature if applicable
+    computed_temp = apply_flood_modifier("temp", computed_temp, targets, flood_state, nile_adjacent)
+
+    -- ===== Humidity (relaxed toward target) =====
+    local current_humidity: number = micro_humidity.current or targets.humidity or 50
+    local target_humidity: number = targets.humidity or 50
+    target_humidity = apply_flood_modifier("humidity", target_humidity, targets, flood_state, nile_adjacent)
+    local computed_humidity: number = relax_value(current_humidity, target_humidity, RELAXATION_RATE, NOISE_SCALE_DEFAULT)
+
+    -- ===== Pressure (relaxed toward target + background driver offset) =====
+    local current_pressure: number = micro_pressure.current or targets.pressure or 1013
+    local target_pressure: number = targets.pressure or 1013
+    local evolved_pressure: number = relax_value(current_pressure, target_pressure, RELAXATION_RATE, NOISE_SCALE_DEFAULT)
+    -- Mix in the background pressure driver from Proc3
+    local computed_pressure: number = evolved_pressure + pressure_driver_offset
+
+    -- ===== Wind speed (relaxed toward target with variability noise) =====
+    local current_wind_speed: number = micro_wind_speed.current or targets.wind_speed or 10
+    local target_wind_speed: number = targets.wind_speed or 10
+    local computed_wind_speed: number = relax_value(current_wind_speed, target_wind_speed, RELAXATION_RATE, wind_variability)
+
+    -- ===== Wind direction (angular interpolation toward target) =====
+    local current_wind_dir: number = micro_wind_dir.current or 0
+    local target_wind_dir: number = cardinal_to_degrees(targets.wind_dir or "N")
+    local computed_wind_dir: number = relax_wind_direction(current_wind_dir, target_wind_dir, RELAXATION_RATE)
+
+    -- ===== Precipitation (relaxed toward target) =====
+    local current_precipitation: number = micro_precipitation.current or targets.precipitation or 0
+    local target_precipitation: number = targets.precipitation or 0
+    local computed_precipitation: number = relax_value(current_precipitation, target_precipitation, RELAXATION_RATE, NOISE_SCALE_DEFAULT)
+
+    -- ===== Dust (relaxed toward target, flood-modified) =====
+    local current_dust: number = micro_dust.current or targets.dust or 0
+    local target_dust: number = targets.dust or 0
+    target_dust = apply_flood_modifier("dust", target_dust, targets, flood_state, nile_adjacent)
+    local computed_dust: number = relax_value(current_dust, target_dust, RELAXATION_RATE, NOISE_SCALE_DEFAULT)
+
+    -- ===== Visibility (relaxed toward target) =====
+    local current_visibility: number = micro_visibility.current or targets.visibility or 50
+    local target_visibility: number = targets.visibility or 50
+    local computed_visibility: number = relax_value(current_visibility, target_visibility, RELAXATION_RATE, NOISE_SCALE_DEFAULT)
+
+    -- ===== EEP and particle (pass-through from targets, no evolution) =====
+    local eep_preset: string = targets.eep_preset or "none"
+    local particle_preset: string = targets.particle or "none"
+
+    -- Write all computed values back to micro LSD keys
+    lsd_write_json(grid_uuid .. ":micro:temp", {current = computed_temp})
+    lsd_write_json(grid_uuid .. ":micro:humidity", {current = computed_humidity})
+    lsd_write_json(grid_uuid .. ":micro:pressure", {current = computed_pressure})
+    lsd_write_json(grid_uuid .. ":micro:wind_speed", {current = computed_wind_speed})
+    lsd_write_json(grid_uuid .. ":micro:wind_dir", {current = computed_wind_dir})
+    lsd_write_json(grid_uuid .. ":micro:precipitation", {current = computed_precipitation})
+    lsd_write_json(grid_uuid .. ":micro:dust", {current = computed_dust})
+    lsd_write_json(grid_uuid .. ":micro:visibility", {current = computed_visibility})
+    lsd_write_json(grid_uuid .. ":micro:eep", {preset = eep_preset})
+    lsd_write_json(grid_uuid .. ":micro:particle", {preset = particle_preset})
+end
+
+-- Process one grid in the round-robin cycle.
+local function process_next_grid_in_round_robin(): ()
+    local registered_grids: {string} = get_registered_grids()
+    local grid_count: number = #registered_grids
+
+    if grid_count == 0 then
+        return
+    end
+
+    if round_robin_index > grid_count then
+        round_robin_index = 1
+    end
+
+    local grid_uuid: string = registered_grids[round_robin_index]
+    evolve_grid_micro(grid_uuid)
+
+    round_robin_index = round_robin_index + 1
+end
+
+--================================================//
+
+--============ Boot Sequence ==================--
+
+local function boot_proc2(): ()
+    LLTimers:every(COMPUTE_INTERVAL_SECONDS, function()
+        process_next_grid_in_round_robin()
+    end)
+
+    ll.OwnerSay("[" .. SCRIPT_ID .. "] Proc2 is ready. Round-robin every "
+        .. tostring(COMPUTE_INTERVAL_SECONDS) .. "s.")
+end
+
+--================================================//
+
+--=============== Events =======================--
+
+LLEvents:on("link_message", function(sender_num: number, num: number, str: string, id: string)
+    if num ~= LINK_MSG_MARKER then return end
+    -- Proc2 does not handle link messages from Main in this phase.
+    -- It only does round-robin compute on its timer.
+end)
+
+LLEvents:on("linkset_data", function(action: number, name: string, value: string)
+    -- Future: react to changes in targets or drivers.
+end)
+
+--================================================//
+
+-- Boot on script load.
+boot_proc2()

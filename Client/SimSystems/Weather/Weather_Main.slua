@@ -1,113 +1,858 @@
 --!strict
 --
--- Main script for the Seshat weather system. It conducts surrounding scripts and serves as primary controller for the system,
--- incl. managing reboots, collating data, and so on.
--- See Documentation in the repo for architecture and design details.
+-- Main script for the Seshat Weather System.
+-- Orchestrator and message relay for the weather processor object.
+-- Manages grid registration, namespace scaffolding, message routing,
+-- reset pipeline, and grid timeout tracking.
+--
+-- See Documentation/DESIGN.md and Documentation/COMMS_PROTOCOL.md
+-- for architecture and protocol details.
 --
 
---============== Constants =============--
-local API -- Defined at the bottom of the page.
+--================== Constants ==================--
+
 local SCRIPT_ID = "MAIN"
---======================================--
 
---=============== Tables ===============--
-local events = {} -- Holds registrations for events.
+-- Communication channels
+local COMMS_CHANNEL = -77777  -- Private channel for grid <-> processor communication
+local ADMIN_CHANNEL = -88888  -- Owner-only channel for admin commands (future)
 
---======================================--
+-- Link message marker: identifies weather system link messages
+-- so procs can distinguish them from unrelated link messages.
+local LINK_MSG_MARKER = 7777
 
---============= Utilities ==============--
--- Important utility functions to make my life easier.
+-- Link target: all scripts in this prim (single-prim object)
+local LINK_ALL_SCRIPTS = -1
 
-local function read(lsdKey, ...): string
-    local password = ... or false
-    if password then
-        return ll.LinksetDataReadProtected(lsdKey, password)
-    else
-        return ll.LinksetDataRead(lsdKey)
-    end
-end
+-- Grid timeout: if no message from a grid in this many seconds, purge it.
+local GRID_TIMEOUT_SECONDS = 300
+local TIMEOUT_CHECK_INTERVAL_SECONDS = 60
 
-local function write(keyName, value, ...): number -- Returns 0 success, error code otherwise.
-    local password = ... or false
-    if password then
-        return ll.LinksetDataWriteProtected(keyName, value, password)
-    else
-        return ll.LinksetDataWrite(keyName, value)
-    end
-end
+-- Beacon: Main broadcasts its key periodically so grids can discover
+-- the processor object without hardcoding it in a notecard.
+local BEACON_INTERVAL_SECONDS = 30
 
-local function api_exists(callback_name: string): boolean
-    return API and API.callbacks and API.callbacks[callback_name] ~= nil
-end
-
-local function unpack_json(json_string: string): table
-    local success, unpacked_table = pcall(lljson.decode, json_string)
-    if not success then
-        return {}
-    end
-    return unpacked_table
-end
-
---=============== System ===============--
-
---=============== Events ===============--
-
--- Register linkset data event so we can respond to LSD updates.
-events.linkset_data = LLEvents:on("linkset_data", function(action: number, name: string, value: string)
-    -- Stub.
-    -- Intended to handle linkset data updates.
-end)
-
-events.link_message = LLEvents:on("link_message", function(sender_num: number, num: number, str: string, id: string)
-    local struct, operation_type = parse_link_message_to_table(num, str)
-    
-    if struct then
-        if operation_type == "event" then
-            process_struct(struct)
-        end
-    end
-    
-end)
-
---============== API ===============--
--- API declared LAST so it has access to everything else.
-API = {
-    version = 0000001,
-    callbacks = {
-        SYSTEM_REBOOT = function(exceptions: { [string]: boolean }) 
-            -- Handle system reboot with exceptions
-            -- todo: add logic
-
-            -- 1: Generate list of all scripts in this link sans exceptions.
-            
-            -- 2: build coroutine with reboot list (populate script names automatically, slash exceptions)
-            --    coroutine will listen for scripts to report successful reboots via link message
-            --    then triggers Main to reboot, completing the reboot request.
-
-            -- 3: When ready, launch coroutine and trigger reboots.
-
-            -- 4: Reboot self (coroutine should solve this automatically)
-
-            -- No return value needed.
-        end,
-        SOME_CALL = function() 
-            -- Handle some call
-            print("Some call")
-            return end,
-        TestWrite = function(k, v)
-            return write(k, v)
-        end,
-        TestRead = function(k)
-            return read(k)
-        end,
-    }
+-- Operation IDs (from COMMS_PROTOCOL.md op table)
+local OP = {
+    REGISTER     = 1,
+    UNREGISTER   = 2,
+    STATE_POLL   = 3,
+    STATE_RESP   = 4,
+    META_REQ     = 5,
+    META_RESP    = 6,
+    TARGET_PUSH  = 7,
+    ADMIN_TARGET = 8,   -- Admin: set target bias (Main → Grid)
+    ADMIN_FORCE  = 9,   -- Admin: force/lock state (Main → Grid)
+    ADMIN_UNLOCK = 10,  -- Admin: release lock (Main → Grid)
+    ADMIN_DUMP   = 11,  -- Admin: dump state to owner chat (Main → Grid)
+    ADMIN_DEBUG  = 12,  -- Admin: toggle debug mode (Main → Grid)
+    BEACON       = 13,  -- Main → all grids: discovery broadcast with processor key
 }
 
-local w = API.callbacks.TestWrite("testKey", "testValue")
-local r = if w then API.callbacks.TestRead("testKeey") else false
+-- Recipient IDs (from COMMS_PROTOCOL.md recipient table)
+local RECIPIENT = {
+    MAIN  = 1,
+    PROC1 = 2,
+    PROC2 = 3,
+    PROC3 = 4,
+    GRID  = 5,
+}
 
-if r then
-    print(r)
-else
-    print("Not found.")
+-- LSD key names (global keys owned by Main)
+local LSD_KEY_GRIDS = "grids"
+local LSD_KEY_RESET_MODE = "reset_mode"
+
+-- LSD key prefixes for driver keys (owned by Proc3, but Main cleans them on full reset)
+local LSD_KEY_DRIVERS_FLOOD_STATE = "drivers:flood_state"
+local LSD_KEY_DRIVERS_PRESSURE = "drivers:pressure"
+local LSD_KEY_DRIVERS_EXTREME_WEATHER = "drivers:extreme_weather"
+
+-- Reset modes
+local RESET_MODE_SOFT = "soft"
+local RESET_MODE_FULL = "full"
+
+-- Admin command keywords
+local ADMIN_CMD_TARGET = "target"
+local ADMIN_CMD_FORCE = "force"
+local ADMIN_CMD_UNLOCK = "unlock"
+local ADMIN_CMD_RESET = "reset"
+local ADMIN_CMD_DUMP = "dump"
+local ADMIN_CMD_DEBUG = "debug"
+
+-- Admin command parameters
+local ADMIN_RESET_PARAM_FULL = "full"
+local ADMIN_RESET_PARAM_SOFT = "soft"
+local ADMIN_DEBUG_ON = "on"
+local ADMIN_DEBUG_OFF = "off"
+
+-- Target bias parameters (sent to grid in the admin message)
+local TARGET_BIAS_THRESHOLD_MULTIPLIER = 0.5   -- Halves condition thresholds for biased target
+local TARGET_BIAS_WEIGHT_MULTIPLIER = 10       -- Multiplies weight for biased target path
+local TARGET_BIAS_EXPIRY_MINUTES = 30          -- Bias expires after 30 minutes
+
+-- Force lock default duration (minutes) if not specified
+local FORCE_LOCK_DEFAULT_MINUTES = 30
+
+-- Per-grid micro field keys that Main scaffolds on registration.
+-- Each becomes <grid_uuid>:micro:<field_name> in LSD.
+local MICRO_FIELD_KEYS: {string} = {
+    "temp",
+    "humidity",
+    "pressure",
+    "wind_speed",
+    "wind_dir",
+    "precipitation",
+    "dust",
+    "visibility",
+    "eep",
+    "particle",
+}
+
+--================================================//
+
+--================== State ==================--
+
+-- Tracks the last unix timestamp we received any message from each grid.
+-- Used for timeout detection. Not persisted to LSD — resets on Main reboot.
+local grid_last_heard_from: { [string]: number } = {}
+
+-- Tracks which proc recipient ID requested metadata for each grid.
+-- Used to route META_RESP back to the correct proc.
+-- Keyed by grid_uuid, value is recipient ID (RECIPIENT.PROC1 or RECIPIENT.PROC2).
+local pending_meta_requester: { [string]: number } = {}
+
+--================================================//
+
+--================= Utilities =================--
+
+-- Read a raw string from LSD. Returns empty string if key not found.
+local function lsd_read(key_name: string): string
+    local value: string = ll.LinksetDataRead(key_name) or ""
+    return value
 end
+
+-- Write a string to LSD. Returns true on success, false on error.
+local function lsd_write(key_name: string, value: string): boolean
+    local result: number = ll.LinksetDataWrite(key_name, value)
+    return result == 0
+end
+
+-- Delete a key from LSD. Returns true on success or if key did not exist.
+local function lsd_delete(key_name: string): boolean
+    local result: number = ll.LinksetDataDelete(key_name)
+    return result == 0
+end
+
+-- Read a JSON-encoded value from LSD. Returns decoded table or nil.
+local function lsd_read_json(key_name: string): any
+    local raw: string = lsd_read(key_name)
+    if raw == "" then
+        return nil
+    end
+    local success, decoded = pcall(lljson.decode, raw)
+    if not success then
+        return nil
+    end
+    return decoded
+end
+
+-- Encode a value to JSON and write it to LSD. Returns true on success.
+local function lsd_write_json(key_name: string, value: any): boolean
+    local encoded: string = lljson.encode(value)
+    return lsd_write(key_name, encoded)
+end
+
+-- Safely decode a JSON string. Returns decoded value or nil on failure.
+local function json_decode_safe(json_string: string): any
+    local success, decoded = pcall(lljson.decode, json_string)
+    if not success then
+        return nil
+    end
+    return decoded
+end
+
+-- Safely encode a value to JSON. Returns JSON string or empty string on failure.
+local function json_encode_safe(value: any): string
+    local success, encoded = pcall(lljson.encode, value)
+    if not success then
+        return ""
+    end
+    return encoded
+end
+
+--================================================//
+
+--=============== Grid Registry ===============--
+
+-- Get the list of registered grid UUIDs from the LSD grids CSV.
+local function get_registered_grids(): {string}
+    local raw: string = lsd_read(LSD_KEY_GRIDS)
+    if raw == "" then
+        return {}
+    end
+    local grids: {string} = {}
+    for uuid in string.gmatch(raw, "[^,]+") do
+        table.insert(grids, uuid)
+    end
+    return grids
+end
+
+-- Add a grid UUID to the LSD grids CSV. No-op if already present.
+local function add_grid_to_registry(grid_uuid: string): boolean
+    local current_grids: {string} = get_registered_grids()
+
+    for _, existing_uuid in ipairs(current_grids) do
+        if existing_uuid == grid_uuid then
+            return true  -- Already registered
+        end
+    end
+
+    table.insert(current_grids, grid_uuid)
+    local csv: string = table.concat(current_grids, ",")
+    return lsd_write(LSD_KEY_GRIDS, csv)
+end
+
+-- Remove a grid UUID from the LSD grids CSV.
+local function remove_grid_from_registry(grid_uuid: string): boolean
+    local current_grids: {string} = get_registered_grids()
+    local remaining: {string} = {}
+
+    for _, existing_uuid in ipairs(current_grids) do
+        if existing_uuid ~= grid_uuid then
+            table.insert(remaining, existing_uuid)
+        end
+    end
+
+    local csv: string = table.concat(remaining, ",")
+    return lsd_write(LSD_KEY_GRIDS, csv)
+end
+
+--================================================//
+
+--=========== Namespace Scaffolding ===========--
+
+-- Scaffold all namespace keys for a newly registered grid.
+-- Main owns the namespace lifecycle — procs populate, never create.
+local function scaffold_grid_namespace(grid_uuid: string, config: any, targets: any): boolean
+    -- Write grid metadata (biome, climate, lat, etc.)
+    lsd_write_json(grid_uuid .. ":meta", config)
+
+    -- Write initial target parameters (Clear Skies for current season)
+    lsd_write_json(grid_uuid .. ":targets", targets)
+
+    -- Scaffold macro key with empty default (Proc1 will populate)
+    lsd_write_json(grid_uuid .. ":macro:evolution", {})
+
+    -- Scaffold each micro key with empty default (Proc2 will populate)
+    for _, field_name in ipairs(MICRO_FIELD_KEYS) do
+        lsd_write_json(grid_uuid .. ":micro:" .. field_name, {})
+    end
+
+    return true
+end
+
+-- Delete all namespace keys for a grid (on unregister or full reset).
+local function cleanup_grid_namespace(grid_uuid: string): boolean
+    lsd_delete(grid_uuid .. ":meta")
+    lsd_delete(grid_uuid .. ":targets")
+    lsd_delete(grid_uuid .. ":macro:evolution")
+
+    for _, field_name in ipairs(MICRO_FIELD_KEYS) do
+        lsd_delete(grid_uuid .. ":micro:" .. field_name)
+    end
+
+    return true
+end
+
+-- Re-scaffold any missing namespace keys for a grid.
+-- Used on soft reset or normal boot to repair partial LSD state.
+local function ensure_grid_namespace(grid_uuid: string): boolean
+    if lsd_read(grid_uuid .. ":meta") == "" then
+        lsd_write_json(grid_uuid .. ":meta", {})
+    end
+    if lsd_read(grid_uuid .. ":targets") == "" then
+        lsd_write_json(grid_uuid .. ":targets", {})
+    end
+    if lsd_read(grid_uuid .. ":macro:evolution") == "" then
+        lsd_write_json(grid_uuid .. ":macro:evolution", {})
+    end
+    for _, field_name in ipairs(MICRO_FIELD_KEYS) do
+        local key: string = grid_uuid .. ":micro:" .. field_name
+        if lsd_read(key) == "" then
+            lsd_write_json(key, {})
+        end
+    end
+    return true
+end
+
+--================================================//
+
+--============ Message Envelope ===============--
+
+-- Build a message envelope table.
+-- o: operations array (op IDs)
+-- f: from string ("uuid:script_id")
+-- t: recipients array (recipient IDs)
+-- p: payloads array (one per op)
+local function build_envelope(ops: {number}, from: string, recipients: {number}, payloads: {any}): any
+    return {
+        o = ops,
+        f = from,
+        t = recipients,
+        p = payloads,
+    }
+end
+
+-- Build the "from" string for this Main script.
+local function self_from_string(): string
+    return ll.GetKey() .. ":" .. SCRIPT_ID
+end
+
+-- Send a message envelope to a specific grid prim via llRegionSayTo.
+local function send_to_grid(grid_uuid: string, envelope: any): ()
+    local message: string = json_encode_safe(envelope)
+    if message == "" then
+        ll.OwnerSay("[" .. SCRIPT_ID .. "] ERROR: Failed to encode message for grid " .. grid_uuid)
+        return
+    end
+    ll.RegionSayTo(grid_uuid, COMMS_CHANNEL, message)
+end
+
+-- Send a message envelope to all processor scripts via link message.
+-- All scripts in the prim receive it; each proc checks the `t` field
+-- to determine if it is the intended recipient.
+local function send_to_procs(envelope: any): ()
+    local message: string = json_encode_safe(envelope)
+    if message == "" then
+        ll.OwnerSay("[" .. SCRIPT_ID .. "] ERROR: Failed to encode link message")
+        return
+    end
+    ll.MessageLinked(LINK_ALL_SCRIPTS, LINK_MSG_MARKER, message, "")
+end
+
+--================================================//
+
+--============== Op Handlers ==================--
+
+-- Broadcast a discovery beacon so grids can learn this processor object's key.
+-- Uses ll.RegionSay (broadcast to all listeners on the channel) since we don't
+-- know which grids are out there yet. Grids store the key and use ll.RegionSayTo
+-- for all subsequent targeted communication.
+local function broadcast_beacon(): ()
+    local envelope: any = {
+        o = {OP.BEACON},
+        f = ll.GetKey() .. ":" .. SCRIPT_ID,
+        t = {RECIPIENT.GRID},
+        p = {{ll.GetKey()}},
+    }
+    local message: string = json_encode_safe(envelope)
+    if message == "" then return end
+    ll.RegionSay(COMMS_CHANNEL, message)
+end
+
+-- Handle REGISTER: add grid to registry, scaffold namespace, store targets.
+local function handle_register(grid_uuid: string, config: any, targets: any): ()
+    add_grid_to_registry(grid_uuid)
+    scaffold_grid_namespace(grid_uuid, config, targets)
+    grid_last_heard_from[grid_uuid] = os.time()
+    ll.OwnerSay("[" .. SCRIPT_ID .. "] Grid registered: " .. grid_uuid)
+end
+
+-- Handle UNREGISTER: remove grid from registry, clean up namespace.
+local function handle_unregister(grid_uuid: string): ()
+    remove_grid_from_registry(grid_uuid)
+    cleanup_grid_namespace(grid_uuid)
+    grid_last_heard_from[grid_uuid] = nil
+    pending_meta_requester[grid_uuid] = nil
+    ll.OwnerSay("[" .. SCRIPT_ID .. "] Grid unregistered: " .. grid_uuid)
+end
+
+-- Handle TARGET_PUSH: update the grid's targets in LSD.
+-- Procs will pick up the new targets on their next round-robin cycle.
+local function handle_target_push(grid_uuid: string, targets: any): ()
+    lsd_write_json(grid_uuid .. ":targets", targets)
+    grid_last_heard_from[grid_uuid] = os.time()
+end
+
+-- Handle STATE_POLL: relay the poll to Proc1 via link message.
+-- Proc1 will read the namespace, assemble the response, and send STATE_RESP back.
+local function handle_state_poll(grid_uuid: string): ()
+    local envelope: any = build_envelope(
+        {OP.STATE_POLL},
+        self_from_string(),
+        {RECIPIENT.PROC1},
+        {{grid_uuid}}
+    )
+    send_to_procs(envelope)
+    grid_last_heard_from[grid_uuid] = os.time()
+end
+
+-- Handle STATE_RESP (from Proc1): relay computed values to the grid.
+local function handle_state_resp(grid_uuid: string, values: any, evolution: any): ()
+    local envelope: any = build_envelope(
+        {OP.STATE_RESP},
+        self_from_string(),
+        {RECIPIENT.GRID},
+        {{grid_uuid, values, evolution}}
+    )
+    send_to_grid(grid_uuid, envelope)
+end
+
+-- Handle META_REQ (from a proc): relay to the grid, track which proc asked.
+local function handle_meta_req(method: string, grid_uuid: string, requesting_proc: number): ()
+    pending_meta_requester[grid_uuid] = requesting_proc
+    local envelope: any = build_envelope(
+        {OP.META_REQ},
+        self_from_string(),
+        {RECIPIENT.GRID},
+        {{method, grid_uuid}}
+    )
+    send_to_grid(grid_uuid, envelope)
+end
+
+-- Handle META_RESP (from grid): relay to the proc that originally requested.
+local function handle_meta_resp(method: string, grid_uuid: string, data: any): ()
+    local requesting_proc: number = pending_meta_requester[grid_uuid] or RECIPIENT.PROC1
+    pending_meta_requester[grid_uuid] = nil
+
+    local envelope: any = build_envelope(
+        {OP.META_RESP},
+        self_from_string(),
+        {requesting_proc},
+        {{method, grid_uuid, data}}
+    )
+    send_to_procs(envelope)
+    grid_last_heard_from[grid_uuid] = os.time()
+end
+
+--================================================//
+
+--========= Inbound Message Dispatch ===========--
+
+-- Process an inbound message envelope from a grid prim (via listen).
+local function process_inbound_from_grid(envelope: any): ()
+    local ops: {number} = envelope.o or {}
+    local payloads: {any} = envelope.p or {}
+
+    for i, op_id in ipairs(ops) do
+        local payload: any = payloads[i] or {}
+
+        if op_id == OP.REGISTER then
+            local grid_uuid: string = payload[1]
+            local config: any = payload[2]
+            local targets: any = payload[3]
+            handle_register(grid_uuid, config, targets)
+
+        elseif op_id == OP.UNREGISTER then
+            local grid_uuid: string = payload[1]
+            handle_unregister(grid_uuid)
+
+        elseif op_id == OP.STATE_POLL then
+            local grid_uuid: string = payload[1]
+            handle_state_poll(grid_uuid)
+
+        elseif op_id == OP.TARGET_PUSH then
+            local grid_uuid: string = payload[1]
+            local targets: any = payload[2]
+            handle_target_push(grid_uuid, targets)
+
+        elseif op_id == OP.META_RESP then
+            local method: string = payload[1]
+            local grid_uuid: string = payload[2]
+            local data: any = payload[3]
+            handle_meta_resp(method, grid_uuid, data)
+
+        else
+            ll.OwnerSay("[" .. SCRIPT_ID .. "] WARNING: Unknown op " .. tostring(op_id) .. " from grid")
+        end
+    end
+end
+
+-- Determine which proc sent a link message based on the `f` field.
+local function parse_sender_proc(from_string: string): number
+    if string.find(from_string, ":proc1") then
+        return RECIPIENT.PROC1
+    elseif string.find(from_string, ":proc2") then
+        return RECIPIENT.PROC2
+    elseif string.find(from_string, ":proc3") then
+        return RECIPIENT.PROC3
+    end
+    return RECIPIENT.MAIN
+end
+
+-- Process an inbound message envelope from a processor script (via link message).
+local function process_inbound_from_proc(envelope: any): ()
+    local ops: {number} = envelope.o or {}
+    local payloads: {any} = envelope.p or {}
+    local from_string: string = envelope.f or ""
+    local sender_proc: number = parse_sender_proc(from_string)
+
+    for i, op_id in ipairs(ops) do
+        local payload: any = payloads[i] or {}
+
+        if op_id == OP.STATE_RESP then
+            local grid_uuid: string = payload[1]
+            local values: any = payload[2]
+            local evolution: any = payload[3]
+            handle_state_resp(grid_uuid, values, evolution)
+
+        elseif op_id == OP.META_REQ then
+            local method: string = payload[1]
+            local grid_uuid: string = payload[2]
+            handle_meta_req(method, grid_uuid, sender_proc)
+
+        else
+            ll.OwnerSay("[" .. SCRIPT_ID .. "] WARNING: Unexpected op " .. tostring(op_id) .. " from proc")
+        end
+    end
+end
+
+--================================================//
+
+--========== Timeout Tracking =================--
+
+-- Check all registered grids for timeout. Purge grids that haven't been heard from.
+local function check_grid_timeouts(): ()
+    local current_time: number = os.time()
+    local registered_grids: {string} = get_registered_grids()
+
+    for _, grid_uuid in ipairs(registered_grids) do
+        local last_heard: number = grid_last_heard_from[grid_uuid]
+        if last_heard then
+            local elapsed: number = current_time - last_heard
+            if elapsed > GRID_TIMEOUT_SECONDS then
+                ll.OwnerSay("[" .. SCRIPT_ID .. "] Grid timed out: " .. grid_uuid
+                    .. " (no response in " .. tostring(elapsed) .. "s)")
+                handle_unregister(grid_uuid)
+            end
+        end
+    end
+end
+
+--================================================//
+
+--============ Reset Pipeline =================--
+
+-- Execute a full reset: wipe all grid namespaces, clear registry, clear drivers.
+local function execute_full_reset(): ()
+    ll.OwnerSay("[" .. SCRIPT_ID .. "] Executing FULL reset...")
+
+    -- Write reset mode flag so a rebooted Main knows to continue the full reset
+    lsd_write(LSD_KEY_RESET_MODE, RESET_MODE_FULL)
+
+    -- Clean up all grid namespaces
+    local current_grids: {string} = get_registered_grids()
+    for _, grid_uuid in ipairs(current_grids) do
+        cleanup_grid_namespace(grid_uuid)
+    end
+
+    -- Clear grids registry
+    lsd_write(LSD_KEY_GRIDS, "")
+
+    -- Clear driver keys (owned by Proc3, but Main cleans them on full reset)
+    lsd_delete(LSD_KEY_DRIVERS_FLOOD_STATE)
+    lsd_delete(LSD_KEY_DRIVERS_PRESSURE)
+    lsd_delete(LSD_KEY_DRIVERS_EXTREME_WEATHER)
+
+    -- Clear in-memory tracking
+    grid_last_heard_from = {}
+    pending_meta_requester = {}
+
+    -- Clear reset mode flag
+    lsd_delete(LSD_KEY_RESET_MODE)
+
+    ll.OwnerSay("[" .. SCRIPT_ID .. "] FULL reset complete. Awaiting grid re-registrations.")
+end
+
+-- Execute a soft reset: keep LSD data, re-scaffold missing keys, resume.
+local function execute_soft_reset(): ()
+    ll.OwnerSay("[" .. SCRIPT_ID .. "] Executing SOFT reset...")
+
+    lsd_write(LSD_KEY_RESET_MODE, RESET_MODE_SOFT)
+
+    -- Re-scaffold any missing namespace keys for registered grids
+    local current_grids: {string} = get_registered_grids()
+    for _, grid_uuid in ipairs(current_grids) do
+        ensure_grid_namespace(grid_uuid)
+    end
+
+    -- Clear in-memory tracking (will be repopulated as grids check in)
+    grid_last_heard_from = {}
+    pending_meta_requester = {}
+
+    lsd_delete(LSD_KEY_RESET_MODE)
+
+    ll.OwnerSay("[" .. SCRIPT_ID .. "] SOFT reset complete. "
+        .. tostring(#current_grids) .. " grids in registry.")
+end
+
+--================================================//
+
+--============ Admin Commands =================--
+
+-- Send an admin command to a specific grid via the comms channel.
+-- The grid controller receives the message and updates its own transition LSD key.
+-- Main cannot write to a grid's LSD directly — it must send a message.
+local function send_admin_to_grid(grid_uuid: string, admin_action: string, data: any): ()
+    local op_id: number = 0
+    local payload: any = nil
+
+    if admin_action == ADMIN_CMD_TARGET then
+        op_id = OP.ADMIN_TARGET
+        payload = {data, TARGET_BIAS_THRESHOLD_MULTIPLIER, TARGET_BIAS_WEIGHT_MULTIPLIER, TARGET_BIAS_EXPIRY_MINUTES}
+        ll.OwnerSay("[" .. SCRIPT_ID .. "] Target bias sent to " .. grid_uuid .. ": " .. data
+            .. " (expires in " .. tostring(TARGET_BIAS_EXPIRY_MINUTES) .. " min)")
+
+    elseif admin_action == ADMIN_CMD_FORCE then
+        op_id = OP.ADMIN_FORCE
+        local lock_duration_minutes: number = FORCE_LOCK_DEFAULT_MINUTES
+        if data and data.duration then
+            lock_duration_minutes = data.duration
+        end
+        payload = {data.state, lock_duration_minutes}
+        ll.OwnerSay("[" .. SCRIPT_ID .. "] Force lock sent to " .. grid_uuid .. ": " .. data.state
+            .. " for " .. tostring(lock_duration_minutes) .. " min")
+
+    elseif admin_action == ADMIN_CMD_UNLOCK then
+        op_id = OP.ADMIN_UNLOCK
+        payload = {}
+        ll.OwnerSay("[" .. SCRIPT_ID .. "] Unlock sent to " .. grid_uuid)
+
+    elseif admin_action == ADMIN_CMD_DUMP then
+        op_id = OP.ADMIN_DUMP
+        payload = {}
+
+    elseif admin_action == ADMIN_CMD_DEBUG then
+        op_id = OP.ADMIN_DEBUG
+        payload = {data}
+        ll.OwnerSay("[" .. SCRIPT_ID .. "] Debug mode " .. (data and "ON" or "OFF")
+            .. " sent to " .. grid_uuid)
+    end
+
+    if op_id == 0 then return end
+
+    local envelope: any = {
+        o = {op_id},
+        f = ll.GetKey() .. ":" .. SCRIPT_ID,
+        t = {RECIPIENT.GRID},
+        p = {payload},
+    }
+
+    local message: string = json_encode_safe(envelope)
+    if message == "" then
+        ll.OwnerSay("[" .. SCRIPT_ID .. "] ERROR: Failed to encode admin message for " .. grid_uuid)
+        return
+    end
+
+    ll.RegionSayTo(grid_uuid, COMMS_CHANNEL, message)
+end
+
+-- Parse and execute an admin command string.
+-- Format: "<command> [grid_uuid] [args...]"
+-- If grid_uuid is "all", applies to all registered grids.
+local function execute_admin_command(command_string: string, sender_key: string): ()
+    -- Verify sender is the owner
+    local owner_key: string = ll.GetOwner()
+    if sender_key ~= owner_key then
+        return  -- Silently ignore non-owner commands
+    end
+
+    -- Tokenize the command string
+    local tokens: {string} = {}
+    for token in string.gmatch(command_string, "%S+") do
+        table.insert(tokens, token)
+    end
+
+    if #tokens == 0 then return end
+
+    local command: string = string.lower(tokens[1])
+
+    if command == ADMIN_CMD_RESET then
+        -- reset [full|soft]
+        local reset_type: string = tokens[2] or ADMIN_RESET_PARAM_SOFT
+        if reset_type == ADMIN_RESET_PARAM_FULL then
+            execute_full_reset()
+        else
+            execute_soft_reset()
+        end
+        return
+    end
+
+    -- All other commands require a grid UUID target
+    if #tokens < 2 then
+        ll.OwnerSay("[" .. SCRIPT_ID .. "] Usage: " .. command .. " <grid_uuid|all> [args]")
+        return
+    end
+
+    local grid_target: string = tokens[2]
+    local target_grids: {string} = {}
+
+    if string.lower(grid_target) == "all" then
+        target_grids = get_registered_grids()
+    else
+        target_grids = {grid_target}
+    end
+
+    if #target_grids == 0 then
+        ll.OwnerSay("[" .. SCRIPT_ID .. "] No grids to apply command to.")
+        return
+    end
+
+    if command == ADMIN_CMD_TARGET then
+        -- target <grid_uuid|all> <state_name>
+        if #tokens < 3 then
+            ll.OwnerSay("[" .. SCRIPT_ID .. "] Usage: target <grid_uuid|all> <state_name>")
+            return
+        end
+        local state_name: string = tokens[3]
+        for _, grid_uuid in ipairs(target_grids) do
+            send_admin_to_grid(grid_uuid, ADMIN_CMD_TARGET, state_name)
+        end
+
+    elseif command == ADMIN_CMD_FORCE then
+        -- force <grid_uuid|all> <state_name> [minutes]
+        if #tokens < 3 then
+            ll.OwnerSay("[" .. SCRIPT_ID .. "] Usage: force <grid_uuid|all> <state_name> [minutes]")
+            return
+        end
+        local state_name: string = tokens[3]
+        local duration_minutes: number? = nil
+        if #tokens >= 4 then
+            duration_minutes = tonumber(tokens[4])
+        end
+        local force_data: any = {state = state_name, duration = duration_minutes}
+        for _, grid_uuid in ipairs(target_grids) do
+            send_admin_to_grid(grid_uuid, ADMIN_CMD_FORCE, force_data)
+        end
+
+    elseif command == ADMIN_CMD_UNLOCK then
+        -- unlock <grid_uuid|all>
+        for _, grid_uuid in ipairs(target_grids) do
+            send_admin_to_grid(grid_uuid, ADMIN_CMD_UNLOCK, nil)
+        end
+
+    elseif command == ADMIN_CMD_DUMP then
+        -- dump <grid_uuid|all>
+        for _, grid_uuid in ipairs(target_grids) do
+            send_admin_to_grid(grid_uuid, ADMIN_CMD_DUMP, nil)
+        end
+
+    elseif command == ADMIN_CMD_DEBUG then
+        -- debug <grid_uuid|all> <on|off>
+        if #tokens < 3 then
+            ll.OwnerSay("[" .. SCRIPT_ID .. "] Usage: debug <grid_uuid|all> <on|off>")
+            return
+        end
+        local debug_mode: string = string.lower(tokens[3])
+        local enable_debug: boolean = (debug_mode == ADMIN_DEBUG_ON)
+        for _, grid_uuid in ipairs(target_grids) do
+            send_admin_to_grid(grid_uuid, ADMIN_CMD_DEBUG, enable_debug)
+        end
+
+    else
+        ll.OwnerSay("[" .. SCRIPT_ID .. "] Unknown admin command: " .. command)
+        ll.OwnerSay("  Available: target, force, unlock, reset, dump, debug")
+    end
+end
+
+--================================================//
+
+--============ Boot Sequence ==================--
+
+-- Initialize Main on script start.
+local function boot_main(): ()
+    -- Check for a pending reset from a previous interrupted reset pipeline
+    local reset_mode: string = lsd_read(LSD_KEY_RESET_MODE)
+
+    if reset_mode == RESET_MODE_FULL then
+        ll.OwnerSay("[" .. SCRIPT_ID .. "] Resuming interrupted FULL reset...")
+        execute_full_reset()
+    elseif reset_mode == RESET_MODE_SOFT then
+        ll.OwnerSay("[" .. SCRIPT_ID .. "] Resuming interrupted SOFT reset...")
+        execute_soft_reset()
+    else
+        -- Normal boot: ensure grids CSV exists, repair any missing namespace keys
+        if lsd_read(LSD_KEY_GRIDS) == "" then
+            lsd_write(LSD_KEY_GRIDS, "")
+        end
+
+        local current_grids: {string} = get_registered_grids()
+        if #current_grids > 0 then
+            ll.OwnerSay("[" .. SCRIPT_ID .. "] Booting with "
+                .. tostring(#current_grids) .. " grids in registry.")
+            for _, grid_uuid in ipairs(current_grids) do
+                ensure_grid_namespace(grid_uuid)
+            end
+        else
+            ll.OwnerSay("[" .. SCRIPT_ID .. "] Booting with empty registry. Awaiting grid registrations.")
+        end
+    end
+
+    -- Start listening on the comms channel for grid messages
+    ll.Listen(COMMS_CHANNEL, "", nil, "")
+
+    -- Start listening on the admin channel for owner commands
+    ll.Listen(ADMIN_CHANNEL, "", nil, "")
+
+    -- Broadcast an immediate beacon so any already-running grids can discover us
+    broadcast_beacon()
+
+    -- Start periodic beacon broadcast for grid discovery
+    LLTimers:every(BEACON_INTERVAL_SECONDS, function()
+        broadcast_beacon()
+    end)
+
+    -- Start periodic timeout check
+    LLTimers:every(TIMEOUT_CHECK_INTERVAL_SECONDS, function()
+        check_grid_timeouts()
+    end)
+
+    ll.OwnerSay("[" .. SCRIPT_ID .. "] Main is ready. Comms: " .. tostring(COMMS_CHANNEL)
+        .. ", Admin: " .. tostring(ADMIN_CHANNEL))
+end
+
+--================================================//
+
+--=============== Events =======================--
+
+-- Listen for messages from grid prims on the comms channel.
+LLEvents:on("listen", function(channel: number, name: string, sender_uuid: string, message: string)
+    if channel == ADMIN_CHANNEL then
+        execute_admin_command(message, sender_uuid)
+        return
+    end
+
+    if channel ~= COMMS_CHANNEL then return end
+
+    local envelope: any = json_decode_safe(message)
+    if not envelope then
+        ll.OwnerSay("[" .. SCRIPT_ID .. "] WARNING: Failed to parse message from " .. tostring(sender_uuid))
+        return
+    end
+
+    process_inbound_from_grid(envelope)
+end)
+
+-- Listen for link messages from processor scripts (Proc1, Proc2, Proc3).
+LLEvents:on("link_message", function(sender_num: number, num: number, str: string, id: string)
+    if num ~= LINK_MSG_MARKER then return end
+
+    local envelope: any = json_decode_safe(str)
+    if not envelope then
+        ll.OwnerSay("[" .. SCRIPT_ID .. "] WARNING: Failed to parse link message")
+        return
+    end
+
+    process_inbound_from_proc(envelope)
+end)
+
+-- Linkset data event: fires when any LSD key is written or deleted.
+-- Stub for now — could be used to react to external LSD changes.
+LLEvents:on("linkset_data", function(action: number, name: string, value: string)
+    -- Future: react to changes in reset_mode or other external triggers.
+end)
+
+--================================================//
+
+-- Boot on script load.
+boot_main()

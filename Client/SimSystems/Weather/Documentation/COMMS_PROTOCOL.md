@@ -20,7 +20,7 @@ Every message is a JSON object with four keys:
 - **`o`** — operations. Array of integers, each mapping to an operation via the op table (see below). This is the source of truth for the message: the number of entries in `o` determines the expected length of `t` and `p`. If any array's length does not match `o`, the message is malformed and discarded entirely.
 - **`f`** — from. Sender identifier, typically `object_uuid:script_name`.
 - **`t`** — to. Array of recipient integers, mapped via the recipient table (see below). Order matches `o`. Main is the routing entrypoint and delegates based on the operations array. If `main` (int 1) appears as a recipient, Main performs that op's internal function itself.
-- **`p`** — payload. Array of payloads, one per operation. Order matches `o`. Each payload is a JSON object whose keys are integers mapped via the field dictionary (see below).
+- **`p`** — payload. Array of payloads, one per operation. Order matches `o`. Each payload is a JSON array of the form `[method?, data...]` where `method` is an optional string that names a sub-handler inside the op (e.g., `"full"`, `"delta"`, `"config"`), and `data` is a positional array of values whose layout is fixed per op. If `p[1]` is a string, it is the method and data starts at `p[2]`. If `p[1]` is not a string, there is no method and data starts at `p[1]`. The op ID defines the positional layout — no field names or indices are needed. See "Payload contracts" below.
 
 ### Validation
 
@@ -85,13 +85,19 @@ Three things are mapped to integers on the wire: operations, recipients, and pay
 
 ```lua
 local op = {
-    REGISTER    = 1,
-    UNREGISTER  = 2,
-    STATE_POLL  = 3,
-    STATE_RESP  = 4,
-    META_REQ    = 5,
-    META_RESP   = 6,
-    TARGET_PUSH = 7,
+    REGISTER       = 1,
+    UNREGISTER     = 2,
+    STATE_POLL     = 3,
+    STATE_RESP     = 4,
+    META_REQ       = 5,
+    META_RESP      = 6,
+    TARGET_PUSH    = 7,
+    ADMIN_TARGET   = 8,   -- Main → Grid: set target bias
+    ADMIN_FORCE    = 9,   -- Main → Grid: force/lock state
+    ADMIN_UNLOCK   = 10,  -- Main → Grid: release lock
+    ADMIN_DUMP     = 11,  -- Main → Grid: dump state to owner chat
+    ADMIN_DEBUG    = 12,  -- Main → Grid: toggle debug mode
+    BEACON         = 13,  -- Main → all grids: discovery broadcast with processor key
 }
 ```
 
@@ -129,41 +135,171 @@ Example: a `STATE_RESP` bound for grid `abc123`:
   "o": [4],
   "f": "proc_uuid:proc1",
   "t": [5],
-  "p": [{"1": "abc123", "2": 24, "3": 35}]
+  "p": [["abc123", {"temp": 24, "humidity": 35, "pressure": 1012, "wind_speed": 15, "wind_dir": 315, "precipitation": 5, "dust": 0, "visibility": 50}, {"pressure_trend": -0.08, "pressure_driver_offset": -2.3}]]
 }
 ```
 
-`t: [5]` means "for a grid." Payload field `1` (the `grid` field) tells Main which grid.
+`t: [5]` means "for a grid." Payload `p[1]` is the grid UUID — Main routes via `llRegionSayTo` to that object. The rest of the payload array is the op's positional data, consumed by the grid on receipt.
 
-### Field dictionary
+### Payload contracts
 
-Payload field names are mapped to integers. The dictionary is global — one table shared across all ops. A field like `grid` always has the same int regardless of which op's payload it appears in.
+Each op defines its own positional payload layout. The receiver knows what to expect based on the op ID alone — no field dictionary, no key lookup. If `p[1]` is a string, it is a method (sub-handler inside the op); otherwise data starts at `p[1]`.
 
-```lua
-local field = {
-    grid       = 1,
-    temp       = 2,
-    humidity   = 3,
-    pressure   = 4,
-    wind_speed = 5,
-    wind_dir   = 6,
-    uuid       = 7,
-    biome      = 8,
-    -- etc, to be expanded as payload schemas are defined
-}
+#### REGISTER (1) — Grid → Main
+
+Grid registers with the orchestrator and sends its initial targets.
+
+```
+p = [grid_uuid, config, targets]
 ```
 
-Sender uses `field.grid` (→ `1`) when building payloads. Receiver accesses fields by int directly, with a comment indicating the field name for readability:
+| Position | Name | Type | Description |
+|---|---|---|---|
+| 1 | grid_uuid | string | Object UUID of the grid prim |
+| 2 | config | object | Grid metadata: `{biome, climate, lat, eep_enabled, eep_experience, nile_adjacent}` |
+| 3 | targets | object | Initial target parameters (Clear Skies for current season): `{temp_base, temp_diurnal, temp_phase, humidity, pressure, wind_speed, wind_dir, wind_variability, precipitation, dust, visibility, eep_preset, particle, flood_*}` |
+
+No method — this is the only REGISTER variant.
+
+#### UNREGISTER (2) — Grid → Main
+
+Grid deregisters from the orchestrator.
+
+```
+p = [grid_uuid]
+```
+
+| Position | Name | Type | Description |
+|---|---|---|---|
+| 1 | grid_uuid | string | Object UUID of the grid prim |
+
+#### STATE_POLL (3) — Grid → Main → Proc1
+
+Grid requests current computed values for its namespace.
+
+```
+p = [grid_uuid]
+```
+
+| Position | Name | Type | Description |
+|---|---|---|---|
+| 1 | grid_uuid | string | Object UUID of the grid prim |
+
+Main relays to Proc1. Proc1 reads `macro:evolution` and `micro:*` from LSD, assembles the response, and sends STATE_RESP back through Main.
+
+#### STATE_RESP (4) — Proc1 → Main → Grid
+
+Processor returns computed values and evolution data to the grid.
+
+```
+p = [grid_uuid, values, evolution]
+```
+
+| Position | Name | Type | Description |
+|---|---|---|---|
+| 1 | grid_uuid | string | Object UUID of the grid prim |
+| 2 | values | object | Computed micro values: `{temp, humidity, pressure, wind_speed, wind_dir, precipitation, dust, visibility}` |
+| 3 | evolution | object | Macro/evolution data: `{pressure_trend, pressure_driver_offset}` — the driver trend from Proc3, for grid cross-checking against its local trend |
+
+Optional method: `"full"` (default, all fields) or `"delta"` (only changed fields since last poll — future optimization, not in v1).
+
+#### META_REQ (5) — Proc → Main → Grid
+
+Processor requests metadata from the grid (e.g., full config or state definitions).
+
+```
+p = [method, grid_uuid]
+```
+
+| Position | Name | Type | Description |
+|---|---|---|---|
+| 1 | method | string | What metadata to request: `"config"` (grid metadata) or `"states"` (full weather state definitions for the current season) |
+| 2 | grid_uuid | string | Object UUID of the grid prim |
+
+Method is required for META_REQ — it tells the grid which data set to assemble.
+
+#### META_RESP (6) — Grid → Main → Proc
+
+Grid responds to META_REQ with the requested data.
+
+```
+p = [method, grid_uuid, data]
+```
+
+| Position | Name | Type | Description |
+|---|---|---|---|
+| 1 | method | string | Echoes the method from the matching META_REQ: `"config"` or `"states"` |
+| 2 | grid_uuid | string | Object UUID of the grid prim |
+| 3 | data | object | The requested data. For `"config"`: `{biome, climate, lat, eep_enabled, eep_experience, nile_adjacent}`. For `"states"`: a table of state definitions keyed by state name. |
+
+#### TARGET_PUSH (7) — Grid → Main → Proc1/Proc2
+
+Grid sends new target parameters after a progression decision. The processor evolves toward these on subsequent cycles.
+
+```
+p = [grid_uuid, targets]
+```
+
+| Position | Name | Type | Description |
+|---|---|---|---|
+| 1 | grid_uuid | string | Object UUID of the grid prim |
+| 2 | targets | object | New target parameters: `{temp_base, temp_diurnal, temp_phase, humidity, pressure, wind_speed, wind_dir, wind_variability, precipitation, dust, visibility, eep_preset, particle, flood_peak_humidity, flood_receding_humidity, flood_low_dust, flood_rising_humidity}` |
+
+Main writes `targets` to `<grid_uuid>:targets` in LSD. Proc1 and Proc2 pick up the new targets on their next round-robin pass — no explicit notification needed.
+
+### Payload construction example
 
 ```lua
+-- Building a STATE_POLL message
+local msg = {
+    o = {3},                              -- STATE_POLL
+    f = my_uuid .. ":grid",
+    t = {1},                              -- Main
+    p = { {my_uuid} },                    -- [grid_uuid], no method
+}
+llRegionSayTo(main_uuid, channel, llList2Json(JSON_OBJECT, msg))
+
+-- Building a TARGET_PUSH message
+local msg = {
+    o = {7},                              -- TARGET_PUSH
+    f = my_uuid .. ":grid",
+    t = {1},                              -- Main
+    p = { {my_uuid, new_targets} },       -- [grid_uuid, targets], no method
+}
+llRegionSayTo(main_uuid, channel, llList2Json(JSON_OBJECT, msg))
+
+-- Building a META_REQ with method
+local msg = {
+    o = {5},                              -- META_REQ
+    f = my_uuid .. ":proc1",
+    t = {1},                              -- Main (relays to grid)
+    p = { {"config", grid_uuid} },        -- [method, grid_uuid]
+}
+llRegionSayTo(main_uuid, channel, llList2Json(JSON_OBJECT, msg))
+```
+
+### Payload consumption example
+
+```lua
+-- Handling a STATE_RESP
 local function handle_state_resp(payload)
-    local grid_uuid = payload[1]   -- grid
-    local temp      = payload[2]   -- temp
-    local humidity  = payload[3]   -- humidity
+    -- No method (p[1] is not a string), so data starts at p[1]
+    local grid_uuid = payload[1]
+    local values    = payload[2]   -- {temp, humidity, pressure, ...}
+    local evolution = payload[3]   -- {pressure_trend, pressure_driver_offset}
+    -- ...
+end
+
+-- Handling a META_REQ
+local function handle_meta_req(payload)
+    -- p[1] is a string → method
+    local method    = payload[1]   -- "config" or "states"
+    local grid_uuid = payload[2]
+    -- ...
 end
 ```
 
-No reverse lookup needed. The field table is always viewable in code for reference.
+No field dictionary needed. The op ID is the contract.
 
 ## Operation catalogue
 
@@ -178,6 +314,12 @@ Payload schemas are not yet specified. The operations below are the current set.
 | 5 | `META_REQ` | Processor → Main → Grid | Processor requests metadata it's missing from a grid's namespace |
 | 6 | `META_RESP` | Grid → Main → Processor | Grid returns requested metadata |
 | 7 | `TARGET_PUSH` | Grid → Main → Processor | Grid sends new target parameters after deciding a state transition is warranted |
+| 8 | `ADMIN_TARGET` | Main → Grid | Admin command: set target bias (eases thresholds, boosts weight for target path) |
+| 9 | `ADMIN_FORCE` | Main → Grid | Admin command: force-lock grid into a specific state |
+| 10 | `ADMIN_UNLOCK` | Main → Grid | Admin command: release a forced lock early |
+| 11 | `ADMIN_DUMP` | Main → Grid | Admin command: dump current state data to owner chat |
+| 12 | `ADMIN_DEBUG` | Main → Grid | Admin command: toggle debug message echoing |
+| 13 | `BEACON` | Main → all grids (broadcast) | Discovery broadcast: carries the processor object's key so grids can target subsequent messages via `llRegionSayTo` |
 
 Assignment and removal are handled by Main writing directly to the `grids` CSV in the shared LSD. Processors follow the registry silently — no explicit assignment or drop messages are needed.
 
@@ -216,6 +358,15 @@ drivers:extreme_weather            → {"active": false, "type": null, ...}
                                       Writer: Proc3
                                       Readers: Proc1, Proc2
                                       Reserved for future extreme weather overrides. Not implemented in v1.
+
+reset_mode                         → "soft" | "full" | (absent)
+                                      Writer: Main (during reset pipeline)
+                                      Readers: Main (on boot, to determine reset intent)
+                                      Set by Main before executing a system reset. If Main reboots
+                                      during the reset, the new instance reads this key to know
+                                      whether to re-scaffold from the grids CSV (soft) or start
+                                      cold (full). Cleared by Main after the reset pipeline
+                                      completes. Absent = normal boot, no reset in progress.
 
 <grid_uuid>:meta                   → {"biome": "desert_coast", "climate": "mediterranean_arid",
                                       "lat": 31.2, "eep_enabled": true, "eep_experience": "<uuid>",
@@ -310,6 +461,7 @@ drivers:extreme_weather            → {"active": false, "type": null, ...}
 | `<grid_uuid>:targets` | Main (on behalf of grid via TARGET_PUSH) | Proc1, Proc2 |
 | `<grid_uuid>:macro:*` | Proc1 | Proc2, grid |
 | `<grid_uuid>:micro:*` | Proc2 | Proc1, grid |
+| `reset_mode` | Main | Main (self, on reboot) |
 
 **Notes:**
 
@@ -332,32 +484,34 @@ config                             → {"biome": "desert_coast", "climate": "med
                                       Writer: notecard loader (once, on first boot)
                                       Readers: grid controller script, sent to processor via META_RESP
 
-Spring/Akhet:Clear Skies           → {"temp_base": 24, "temp_diurnal": 8, "temp_phase": 14,
-                                      "humidity": 35, "pressure": 1015, "wind_speed": 5,
+Akhet:Clear Skies                  → {"temp_base": 24, "temp_diurnal": 4, "temp_phase": 14,
+                                      "humidity": 67, "pressure": 1015, "wind_speed": 15,
                                       "wind_dir": "NW", "wind_variability": 0.3,
-                                      "precipitation": 0, "dust": 0, "visibility": 50,
-                                      "weight": 10, "duration": "4-9",
-                                      "eep_preset": "Clear_Spring_Day", "particle": "none",
+                                      "precipitation": 5, "dust": 0, "visibility": 50,
+                                      "weight": 8, "duration": "5-10",
+                                      "eep_preset": "Clear_Akhet_Day", "particle": "none",
+                                      "progresses_to": "Partly Cloudy",
                                       "flood_peak_humidity": 15, "flood_receding_humidity": 8,
                                       "flood_low_dust": 10}
                                       Writer: notecard loader (once)
                                       Readers: grid controller (used for transition decisions and
                                                to extract target parameters for TARGET_PUSH)
 
-Spring/Akhet:Khamsin               → {"temp_base": 38, ..., "event": true,
+Peret:Khamsin                      → {"temp_base": 38, ..., "event": true,
                                       "eep_preset": "Khamsin_Dust_Storm",
-                                      "particle": "dust_storm_heavy"}
+                                      "particle": "dust_storm_heavy",
+                                      "regresses_to": "Clear Skies"}
                                       Writer: notecard loader (once)
                                       Readers: grid controller
 
-Summer/Shemu:Clear Skies           → {...}
+Shemu:Clear Skies                  → {...}
 ...                                → (one key per defined weather state, per season)
 
-state                              → {"current_state": "Clear Skies", "season": "Spring/Akhet",
-                                      "temp": 24.3, "humidity": 35, "pressure": 1015,
-                                      "wind_speed": 5, "wind_dir": "NW",
-                                      "dust": 0, "precipitation": 0, "visibility": 50,
-                                      "eep_preset": "Clear_Spring_Day", "particle": "none",
+state                              → {"current_state": "Clear Skies", "season": "Akhet",
+                                      "temp": 24.3, "humidity": 67, "pressure": 1015,
+                                      "wind_speed": 15, "wind_dir": "NW",
+                                      "dust": 0, "precipitation": 5, "visibility": 50,
+                                      "eep_preset": "Clear_Akhet_Day", "particle": "none",
                                       "last_update": 1709123456}
                                       Writer: grid controller (updated from STATE_RESP data)
                                       Readers: grid controller (for presentation + transition evaluation)
@@ -365,12 +519,14 @@ state                              → {"current_state": "Clear Skies", "season"
                                       each poll response. The grid evaluates these values against
                                       its state definitions to decide transitions.
 
-transition                         → {"current": "Clear Skies", "season": "Spring/Akhet",
+transition                         → {"current": "Clear Skies", "season": "Akhet",
                                       "pressure_history": [[1709123400, 1014],
                                                            [1709123460, 1012],
                                                            [1709123520, 1011]],
                                       "duration_timer": 120, "duration_target": 480,
-                                      "cooldown": 0}
+                                      "cooldown": 0,
+                                      "lock": null,
+                                      "target_bias": null}
                                       Writer: grid controller
                                       Readers: grid controller
                                       Progression decision state: current state name, timestamped
@@ -381,6 +537,14 @@ transition                         → {"current": "Clear Skies", "season": "Spr
                                       to determine sustained trends — not poll counts. This is the
                                       grid's decision-making workspace for the staged progression
                                       model — not sent to the processor.
+                                      lock: null or {"locked_state": "Storm", "unlock_at": 1709127000}
+                                      — when set, progression is frozen and the grid stays in
+                                      locked_state. Set by admin `force` command, cleared by
+                                      `unlock` or timer expiry.
+                                      target_bias: null or {"target_state": "Cloudy",
+                                      "expires": 1709127000} — when set, progression conditions
+                                      toward target_state are eased (threshold halved, weight x10).
+                                      Set by admin `target` command, cleared by timer expiry.
 ```
 
 **Notes:**

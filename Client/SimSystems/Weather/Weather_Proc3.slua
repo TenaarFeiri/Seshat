@@ -1,0 +1,360 @@
+--!strict
+--
+-- Proc3 (Environment) script for the Seshat Weather System.
+-- Computes global environmental drivers that all grids share:
+--   - Nile flood state (deterministic, from calendar)
+--   - Background atmospheric pressure variation (stochastic, simulates passing pressure systems)
+--
+-- Proc3 runs on its own cadence (default 5 seconds) and writes to drivers:* keys in LSD.
+-- It does not round-robin through grids — its work is global, not per-grid.
+--
+-- See Documentation/DESIGN.md and Documentation/SIMULATION_MATHS.md
+-- for architecture and math details.
+--
+
+--================== Constants ==================--
+
+local SCRIPT_ID = "PROC3"
+
+-- Compute cadence: how often Proc3 updates drivers (seconds)
+local COMPUTE_INTERVAL_SECONDS = 5
+
+-- Link message marker (must match Main's constant)
+local LINK_MSG_MARKER = 7777
+local LINK_ALL_SCRIPTS = -1
+
+-- Operation IDs (from COMMS_PROTOCOL.md op table)
+local OP = {
+    REGISTER     = 1,
+    UNREGISTER   = 2,
+    STATE_POLL   = 3,
+    STATE_RESP   = 4,
+    META_REQ     = 5,
+    META_RESP    = 6,
+    TARGET_PUSH  = 7,
+    ADMIN_TARGET = 8,
+    ADMIN_FORCE  = 9,
+    ADMIN_UNLOCK = 10,
+    ADMIN_DUMP   = 11,
+    ADMIN_DEBUG  = 12,
+}
+
+-- Recipient IDs (from COMMS_PROTOCOL.md recipient table)
+local RECIPIENT = {
+    MAIN  = 1,
+    PROC1 = 2,
+    PROC2 = 3,
+    PROC3 = 4,
+    GRID  = 5,
+}
+
+-- LSD key names for driver output
+local LSD_KEY_DRIVERS_FLOOD_STATE = "drivers:flood_state"
+local LSD_KEY_DRIVERS_PRESSURE = "drivers:pressure"
+local LSD_KEY_DRIVERS_EXTREME_WEATHER = "drivers:extreme_weather"
+
+-- Flood state values
+local FLOOD_STATE_LOW = "low"
+local FLOOD_STATE_RISING = "rising"
+local FLOOD_STATE_PEAK = "peak"
+local FLOOD_STATE_RECEDING = "receding"
+
+-- Flood state day-of-year boundaries (from SIMULATION_MATHS.md section 4)
+local FLOOD_LOW_START_DAY = 60       -- Mar 1
+local FLOOD_LOW_END_DAY = 151        -- Jun 1
+local FLOOD_RISING_START_DAY = 152   -- Jun 1
+local FLOOD_RISING_END_DAY = 212     -- Jul 31
+local FLOOD_PEAK_START_DAY = 213     -- Aug 1
+local FLOOD_PEAK_END_DAY = 304       -- Oct 31
+-- Receding is everything else (Nov 1 – Feb 28/29)
+
+-- Pressure driver parameters (from SIMULATION_MATHS.md section 5)
+local PRESSURE_AMPLITUDE_HPA = 5         -- Base sinusoidal amplitude (±5 hPa)
+local PRESSURE_NOISE_RANGE_HPA = 2       -- Stochastic noise range (±1 hPa each side)
+local PRESSURE_PERIOD_CYCLES = 240       -- Cycles per full sinusoidal wave (240 * 5s = 20 min)
+local PRESSURE_HISTORY_MAX_ENTRIES = 5   -- Rolling window for trend computation
+local PRESSURE_SEED_DIVISOR = 1200       -- Divides os.time() for cold-boot phase seed (1200s = 20min = one full cycle)
+
+-- Cyclone dip parameters
+local CYCLONE_DIP_CHANCE_PER_CYCLE = 0.05  -- 5% chance per cycle to start a dip
+local CYCLONE_DIP_MIN_MAGNITUDE_HPA = -8   -- Minimum dip magnitude
+local CYCLONE_DIP_MAX_MAGNITUDE_HPA = -15  -- Maximum dip magnitude
+local CYCLONE_DIP_DURATION_CYCLES = 20     -- How many cycles a dip lasts
+
+-- Months (for day-of-year computation)
+local DAYS_IN_MONTH_NON_LEAP: {number} = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31}
+local FEBRUARY_INDEX = 2
+local LEAP_YEAR_DIVISOR_4 = 4
+local LEAP_YEAR_DIVISOR_100 = 100
+local LEAP_YEAR_DIVISOR_400 = 400
+
+--================================================//
+
+--================== State ==================--
+
+-- Pressure driver internal state (persisted in drivers:pressure between cycles)
+local pressure_phase: number = 0           -- Current phase of the sinusoidal wave (radians)
+local pressure_offset_history: {number} = {}  -- Rolling window of recent offsets for trend computation
+local cyclone_dip_active: boolean = false   -- Whether a cyclone dip is currently in progress
+local cyclone_dip_magnitude: number = 0     -- Current dip magnitude (negative hPa)
+local cyclone_dip_timer: number = 0         -- Cycles remaining in the current dip
+
+--================================================//
+
+--================= Utilities =================--
+
+-- Read a raw string from LSD. Returns empty string if key not found.
+local function lsd_read(key_name: string): string
+    local value: string = ll.LinksetDataRead(key_name) or ""
+    return value
+end
+
+-- Write a string to LSD. Returns true on success.
+local function lsd_write(key_name: string, value: string): boolean
+    local result: number = ll.LinksetDataWrite(key_name, value)
+    return result == 0
+end
+
+-- Encode a value to JSON and write it to LSD.
+local function lsd_write_json(key_name: string, value: any): boolean
+    local encoded: string = lljson.encode(value)
+    return lsd_write(key_name, encoded)
+end
+
+-- Read and decode a JSON value from LSD. Returns decoded table or nil.
+local function lsd_read_json(key_name: string): any
+    local raw: string = lsd_read(key_name)
+    if raw == "" then
+        return nil
+    end
+    local success, decoded = pcall(lljson.decode, raw)
+    if not success then
+        return nil
+    end
+    return decoded
+end
+
+--================================================//
+
+--========== Date and Flood State =============--
+
+-- Check if a year is a leap year (Gregorian calendar).
+local function is_leap_year(year: number): boolean
+    if year % LEAP_YEAR_DIVISOR_400 == 0 then return true end
+    if year % LEAP_YEAR_DIVISOR_100 == 0 then return false end
+    if year % LEAP_YEAR_DIVISOR_4 == 0 then return true end
+    return false
+end
+
+-- Get the current day of year (1-365 or 1-366) from the SL date.
+local function get_day_of_year(): number
+    local date_string: string = os.date("%Y-%m-%d")
+    local year: number = tonumber(string.sub(date_string, 1, 4)) or 0
+    local month: number = tonumber(string.sub(date_string, 6, 7)) or 1
+    local day: number = tonumber(string.sub(date_string, 9, 10)) or 1
+
+    local days_in_month: {number} = {}
+    for i, dim in ipairs(DAYS_IN_MONTH_NON_LEAP) do
+        days_in_month[i] = dim
+    end
+    if is_leap_year(year) then
+        days_in_month[FEBRUARY_INDEX] = 29
+    end
+
+    local day_of_year: number = day
+    for i = 1, month - 1 do
+        day_of_year = day_of_year + days_in_month[i]
+    end
+
+    return day_of_year
+end
+
+-- Determine the Nile flood state from the day of year.
+-- Deterministic — same day always produces the same state.
+local function get_flood_state(day_of_year: number): string
+    if day_of_year >= FLOOD_LOW_START_DAY and day_of_year <= FLOOD_LOW_END_DAY then
+        return FLOOD_STATE_LOW
+    elseif day_of_year >= FLOOD_RISING_START_DAY and day_of_year <= FLOOD_RISING_END_DAY then
+        return FLOOD_STATE_RISING
+    elseif day_of_year >= FLOOD_PEAK_START_DAY and day_of_year <= FLOOD_PEAK_END_DAY then
+        return FLOOD_STATE_PEAK
+    else
+        return FLOOD_STATE_RECEDING
+    end
+end
+
+-- Compute and write the flood state to LSD.
+local function update_flood_state(): ()
+    local day_of_year: number = get_day_of_year()
+    local flood_state: string = get_flood_state(day_of_year)
+
+    local flood_data: any = {
+        state = flood_state,
+        day_of_year = day_of_year,
+    }
+
+    lsd_write_json(LSD_KEY_DRIVERS_FLOOD_STATE, flood_data)
+end
+
+--================================================//
+
+--======== Background Pressure Driver =========--
+
+-- Compute the linear regression slope over a history of offset values.
+-- Returns the trend in hPa per cycle.
+local function compute_pressure_trend(history: {number}): number
+    local entry_count: number = #history
+    if entry_count < 2 then
+        return 0
+    end
+
+    local sum_x: number = 0
+    local sum_y: number = 0
+    local sum_xy: number = 0
+    local sum_x_squared: number = 0
+
+    for i = 1, entry_count do
+        sum_x = sum_x + i
+        sum_y = sum_y + history[i]
+        sum_xy = sum_xy + i * history[i]
+        sum_x_squared = sum_x_squared + i * i
+    end
+
+    local denominator: number = entry_count * sum_x_squared - sum_x * sum_x
+    if denominator == 0 then
+        return 0
+    end
+
+    local slope: number = (entry_count * sum_xy - sum_x * sum_y) / denominator
+    return slope
+end
+
+-- Compute one cycle of the background pressure driver.
+-- Returns the offset (hPa), trend (hPa/cycle), and phase for this cycle.
+local function compute_pressure_driver_cycle(): {offset: number, trend: number, phase: number}
+    -- Advance the sinusoidal phase
+    local phase_increment: number = (2 * math.pi) / PRESSURE_PERIOD_CYCLES
+    pressure_phase = pressure_phase + phase_increment
+
+    -- Base sinusoidal offset
+    local base_offset: number = PRESSURE_AMPLITUDE_HPA * math.sin(pressure_phase)
+
+    -- Stochastic noise (±1 hPa)
+    local noise: number = (math.random() - 0.5) * PRESSURE_NOISE_RANGE_HPA
+
+    -- Cyclone dip: occasionally inject a deeper pressure dip
+    local dip_offset: number = 0
+    if not cyclone_dip_active and math.random() < CYCLONE_DIP_CHANCE_PER_CYCLE then
+        cyclone_dip_active = true
+        local magnitude_range: number = CYCLONE_DIP_MAX_MAGNITUDE_HPA - CYCLONE_DIP_MIN_MAGNITUDE_HPA
+        cyclone_dip_magnitude = CYCLONE_DIP_MIN_MAGNITUDE_HPA + math.random() * magnitude_range
+        cyclone_dip_timer = CYCLONE_DIP_DURATION_CYCLES
+    end
+
+    if cyclone_dip_active then
+        cyclone_dip_timer = cyclone_dip_timer - 1
+        -- Linear decay from full magnitude to 0 over the dip duration
+        dip_offset = cyclone_dip_magnitude * (cyclone_dip_timer / CYCLONE_DIP_DURATION_CYCLES)
+        if cyclone_dip_timer <= 0 then
+            cyclone_dip_active = false
+            cyclone_dip_magnitude = 0
+        end
+    end
+
+    local total_offset: number = base_offset + noise + dip_offset
+
+    -- Update rolling history for trend computation
+    table.insert(pressure_offset_history, total_offset)
+    if #pressure_offset_history > PRESSURE_HISTORY_MAX_ENTRIES then
+        table.remove(pressure_offset_history, 1)
+    end
+
+    local trend: number = compute_pressure_trend(pressure_offset_history)
+
+    return {
+        offset = total_offset,
+        trend = trend,
+        phase = pressure_phase,
+    }
+end
+
+-- Compute and write the pressure driver state to LSD.
+-- Persists the full internal state so a script reset can resume seamlessly.
+local function update_pressure_driver(): ()
+    local driver_state: any = compute_pressure_driver_cycle()
+
+    local pressure_data: any = {
+        offset = driver_state.offset,
+        trend = driver_state.trend,
+        phase = driver_state.phase,
+        -- Internal state for reset recovery
+        offset_history = pressure_offset_history,
+        cyclone_dip_active = cyclone_dip_active,
+        cyclone_dip_magnitude = cyclone_dip_magnitude,
+        cyclone_dip_timer = cyclone_dip_timer,
+    }
+
+    lsd_write_json(LSD_KEY_DRIVERS_PRESSURE, pressure_data)
+end
+
+--================================================//
+
+--============ Boot Sequence ==================--
+
+-- Initialize Proc3 on script start.
+local function boot_proc3(): ()
+    -- Restore pressure driver state from LSD if available (script reset recovery).
+    -- On a cold boot (empty LSD), seed the phase from the clock so different
+    -- boot times start at different points in the sinusoidal cycle.
+    local saved_pressure: any = lsd_read_json(LSD_KEY_DRIVERS_PRESSURE)
+    if saved_pressure and saved_pressure.phase then
+        -- Warm boot: restore full internal state
+        pressure_phase = saved_pressure.phase
+        if saved_pressure.offset_history then
+            pressure_offset_history = saved_pressure.offset_history
+        end
+        if saved_pressure.cyclone_dip_active ~= nil then
+            cyclone_dip_active = saved_pressure.cyclone_dip_active
+        end
+        if saved_pressure.cyclone_dip_magnitude then
+            cyclone_dip_magnitude = saved_pressure.cyclone_dip_magnitude
+        end
+        if saved_pressure.cyclone_dip_timer then
+            cyclone_dip_timer = saved_pressure.cyclone_dip_timer
+        end
+    else
+        -- Cold boot: seed phase from unix time so the sinusoid doesn't
+        -- always start at zero. One full cycle = PRESSURE_PERIOD_CYCLES * COMPUTE_INTERVAL_SECONDS
+        -- = 240 * 5 = 1200 seconds. Map current time into [0, 2π).
+        local cycle_position: number = (os.time() % PRESSURE_SEED_DIVISOR) / PRESSURE_SEED_DIVISOR
+        pressure_phase = cycle_position * 2 * math.pi
+    end
+
+    -- Compute and write initial driver values immediately
+    update_flood_state()
+    update_pressure_driver()
+
+    -- Start the compute timer
+    LLTimers:every(COMPUTE_INTERVAL_SECONDS, function()
+        update_flood_state()
+        update_pressure_driver()
+    end)
+
+    ll.OwnerSay("[" .. SCRIPT_ID .. "] Proc3 is ready. Computing drivers every "
+        .. tostring(COMPUTE_INTERVAL_SECONDS) .. "s. Phase: "
+        .. string.format("%.3f", pressure_phase) .. " rad")
+end
+
+--================================================//
+
+--=============== Events =======================--
+
+-- Linkset data event: stub for future use.
+LLEvents:on("linkset_data", function(action: number, name: string, value: string)
+    -- Future: react to reset_mode changes or other external triggers.
+end)
+
+--================================================//
+
+-- Boot on script load.
+boot_proc3()

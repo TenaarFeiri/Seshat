@@ -176,15 +176,147 @@ local cardinal_to_deg = {
 }
 ```
 
-## 4. Nile flood state computation
+## 4. Season and flood state computation
 
-The flood state is deterministic — computed from the day of year, not stochastic.
+Both season and flood state are deterministic — computed from the SL date, not stochastic. Season uses month/day comparison (handles leap years naturally). Flood state uses day-of-year (requires leap year awareness).
 
-### Formula
+### Season determination
+
+The system uses the ancient Egyptian calendar with three seasons. Determined from month/day directly — no day-of-year calculation needed, so leap years are handled automatically:
 
 ```
+function get_season(month, day)
+    -- Akhet: Sept 11 – Jan 9  (inundation / flood season)
+    -- Peret: Jan 10 – May 9   (emergence / growth season)
+    -- Shemu: May 10 – Sept 10 (harvest / low water season)
+
+    if (month == 9 and day >= 11) or month == 10 or month == 11
+       or month == 12 or (month == 1 and day <= 9) then
+        return "Akhet"
+    elseif (month == 1 and day >= 10) or month == 2 or month == 3
+           or month == 4 or (month == 5 and day <= 9) then
+        return "Peret"
+    else  -- (month == 5 and day >= 10) or month == 6 or month == 7
+           -- or month == 8 or (month == 9 and day <= 10)
+        return "Shemu"
+    end
+end
+```
+
+### Season blending
+
+In the last 7 days of each season, the grid gradually biases target parameters toward the next season's baseline. This prevents a hard snap at the boundary.
+
+```
+function get_season_blend(month, day)
+    -- Returns: current_season, blend_factor (0.0-1.0), next_season
+    -- blend_factor is 0 except in the last 7 days of a season
+
+    local BLEND_DAYS = 7
+    local season = get_season(month, day)
+
+    -- Determine days remaining in current season
+    local days_to_boundary
+
+    if season == "Akhet" then
+        -- Boundary: Jan 9 → Peret starts Jan 10
+        if month == 1 then
+            days_to_boundary = 9 - day
+        else
+            days_to_boundary = 999  -- not near boundary
+        end
+    elseif season == "Peret" then
+        -- Boundary: May 9 → Shemu starts May 10
+        if month == 5 then
+            days_to_boundary = 9 - day
+        else
+            days_to_boundary = 999
+        end
+    else  -- Shemu
+        -- Boundary: Sept 10 → Akhet starts Sept 11
+        if month == 9 then
+            days_to_boundary = 10 - day
+        else
+            days_to_boundary = 999
+        end
+    end
+
+    if days_to_boundary >= 0 and days_to_boundary <= BLEND_DAYS then
+        local blend = 1.0 - (days_to_boundary / BLEND_DAYS)
+        local next_season = get_next_season(season)
+        return season, blend, next_season
+    end
+
+    return season, 0.0, nil
+end
+
+function get_next_season(season)
+    if season == "Akhet" then return "Peret"
+    elseif season == "Peret" then return "Shemu"
+    else return "Akhet" end
+end
+```
+
+When blending is active, the grid interpolates target parameters between the current season's Clear Skies baseline and the next season's Clear Skies baseline:
+
+```
+function apply_season_blend(targets, current_season, next_season, blend, state_defs)
+    if blend <= 0 or not next_season then
+        return targets  -- no blending needed
+    end
+
+    local current_clear = state_defs[current_season .. ":Clear Skies"]
+    local next_clear = state_defs[next_season .. ":Clear Skies"]
+
+    if not current_clear or not next_clear then
+        return targets  -- can't blend if either is missing
+    end
+
+    -- Blend only the baseline params (temp_base, humidity, pressure, wind)
+    -- Don't blend event-specific params (dust, visibility, eep, particle)
+    local blended = {}
+    for k, v in pairs(targets) do
+        local next_val = next_clear[k]
+        if type(v) == "number" and type(next_val) == "number" then
+            blended[k] = v + (next_val - v) * blend
+        else
+            blended[k] = v
+        end
+    end
+
+    return blended
+end
+```
+
+### Nile flood state
+
+The flood state is deterministic — computed from the day of year. Unlike season lookup, this requires day-of-year calculation, which must handle leap years.
+
+```
+function is_leap_year(year)
+    return (year % 4 == 0 and year % 100 ~= 0) or (year % 400 == 0)
+end
+
+function get_day_of_year()
+    local date = llGetDate()  -- "YYYY-MM-DD"
+    local year = tonumber(string.sub(date, 1, 4))
+    local month = tonumber(string.sub(date, 6, 7))
+    local day = tonumber(string.sub(date, 9, 10))
+
+    local days_in_month = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31}
+    if is_leap_year(year) then
+        days_in_month[2] = 29
+    end
+
+    local doy = day
+    for i = 1, month - 1 do
+        doy = doy + days_in_month[i]
+    end
+
+    return doy
+end
+
 function get_flood_state(day_of_year)
-    -- day_of_year: 1-365 (or 1-360 for SL's 360-day year)
     -- Returns: "low", "rising", "peak", or "receding"
 
     if day_of_year >= 60 and day_of_year <= 151 then
@@ -194,29 +326,12 @@ function get_flood_state(day_of_year)
     elseif day_of_year >= 213 and day_of_year <= 304 then
         return "peak"      -- Aug 1 – Oct 31: maximum inundation
     else
-        return "receding"  -- Nov 1 – Feb 28: water draining
+        return "receding"  -- Nov 1 – Feb 28/29: water draining
     end
 end
 ```
 
-### Day of year from SL date
-
-```
-local days_in_month = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31}
-
-function get_day_of_year()
-    local date = llGetDate()  -- "YYYY-MM-DD"
-    local month = tonumber(string.sub(date, 6, 7))
-    local day = tonumber(string.sub(date, 9, 10))
-
-    local doy = day
-    for i = 1, month - 1 do
-        doy = doy + days_in_month[i]
-    end
-
-    return doy
-end
-```
+Note: The flood state boundaries use fixed day-of-year ranges. In a leap year, days after Feb 29 are shifted by 1, but the boundaries are approximate enough (the flood doesn't change on an exact date) that this is acceptable. The season lookup avoids this issue entirely by using month/day comparison.
 
 ### Applying flood modifiers
 
@@ -621,6 +736,51 @@ end
 
 Note: flood modifiers are included in the target set so the processor knows what modifiers to apply for this state. The processor checks `drivers:flood_state` and applies the matching modifier. This keeps the flood logic in the processor (where the driver data lives) while keeping the modifier definitions in the grid (where the state definitions live).
 
+### Initial state bootstrap
+
+On boot, the grid always starts in Clear Skies for the current season. It sends Clear Skies targets to the processor on registration. On the first poll, the grid evaluates whether the computed values strongly indicate a different state. If so, it jumps directly — bypassing normal progression.
+
+```
+function bootstrap_evaluate(current_values, state_defs, season)
+    -- Called once on first poll after boot
+    -- Returns: state_def to jump to, or nil to stay in Clear Skies
+
+    local pressure = current_values.pressure or 1013
+    local humidity = current_values.humidity or 50
+    local pressure_trend = current_values.pressure_trend or 0
+
+    -- Strong indicators: pressure well below seasonal Clear Skies baseline
+    local clear_skies = state_defs[season .. ":Clear Skies"]
+    if not clear_skies then return nil end
+
+    local baseline_pressure = clear_skies.pressure or 1013
+    local delta = pressure - baseline_pressure
+
+    -- If pressure is >8 hPa below baseline, jump to the deepest matching state
+    if delta < -8 and pressure_trend < -0.2 then
+        -- Rapid drop + very low pressure → event state (Khamsin/Storm)
+        for name, def in pairs(state_defs) do
+            if def.event and string.find(name, season) then
+                return def
+            end
+        end
+    elseif delta < -5 then
+        -- Moderate drop → Cloudy or Rain
+        local cloudy = state_defs[season .. ":Cloudy"]
+        if cloudy then return cloudy end
+    elseif delta < -2 then
+        -- Slight drop → Partly Cloudy
+        local partly = state_defs[season .. ":Partly Cloudy"]
+        if partly then return partly end
+    end
+
+    -- No strong indicator — stay in Clear Skies
+    return nil
+end
+```
+
+This is a one-time call. After the first poll, the grid switches to normal `evaluate_progression()` and never calls `bootstrap_evaluate()` again unless it reboots.
+
 ## 7. Duration parsing
 
 The `duration` field in notecard states is a min-max range (e.g., `4-9`). Parse it:
@@ -660,15 +820,18 @@ local duration_cycles = chosen_duration * 120
 
 | Computation | Where it runs | Frequency |
 |---|---|---|
-| Diurnal temperature | Proc2 | Every cycle |
-| State evolution (relaxation + noise) | Proc1 (macro), Proc2 (micro) | Every cycle |
-| Wind direction interpolation | Proc2 | Every cycle |
+| Season determination | Grid | On boot, on season change |
+| Season blending | Grid | Every poll (in last 7 days of season) |
+| Bootstrap state evaluation | Grid | First poll only after boot |
+| Diurnal temperature | Proc2 | Every cycle (15s) |
+| State evolution (relaxation + noise) | Proc1 (macro), Proc2 (micro) | Every cycle (15s) |
+| Wind direction interpolation | Proc2 | Every cycle (15s) |
 | Nile flood state | Proc3 | Once per day (or on boot) |
 | Flood modifier application | Proc2 | Every cycle (reads flood state from LSD) |
-| Background pressure driver | Proc3 | Every cycle (writes drivers:pressure) |
+| Background pressure driver | Proc3 | Every cycle (5s) |
 | Pressure driver mixing | Proc2 | Every cycle (reads drivers:pressure, adds offset) |
 | Pressure trend exposure | Proc1 | Every cycle (reads drivers:pressure, writes to macro:evolution) |
-| Pressure history recording | Grid | Every poll (appends timestamped reading, prunes old) |
+| Pressure history recording | Grid | Every poll (30s ±5s jitter) |
 | Time-windowed trend computation | Grid | Every poll (5-min linear regression over history) |
 | Driver trend cross-check | Grid | Every poll (compares local trend vs Proc3 trend) |
 | Progression condition check | Grid | Every poll (evaluates candidates against local trend) |

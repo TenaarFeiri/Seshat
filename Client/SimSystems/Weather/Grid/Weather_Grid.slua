@@ -1,0 +1,1328 @@
+--!strict
+--
+-- Grid Controller script for the Seshat Weather System.
+-- Lives in each weather grid prim. Handles:
+--   - Notecard parsing (streaming loader, writes state definitions to LSD)
+--   - Registration with the processor object's Main script
+--   - Polling for computed values (STATE_POLL → STATE_RESP)
+--   - Pressure history tracking and time-windowed trend computation
+--   - Staged progression evaluation (progresses_to / regresses_to / diverges_to)
+--   - Bootstrap state evaluation on first poll after boot
+--   - Sending new target parameters via TARGET_PUSH
+--
+-- See Documentation/DESIGN.md, Documentation/COMMS_PROTOCOL.md,
+-- and Documentation/SIMULATION_MATHS.md for architecture and math details.
+--
+
+--================== Constants ==================--
+
+local SCRIPT_ID = "GRID"
+
+-- Communication
+local COMMS_CHANNEL = -77777  -- Must match Main's COMMS_CHANNEL
+local NOTECARD_NAME = "Alexandria_Oasis"  -- Name of the weather model notecard in the prim's inventory
+
+-- Polling cadence
+local POLL_INTERVAL_SECONDS = 30
+local POLL_JITTER_SECONDS = 5  -- ±5 seconds random jitter to stagger across grids
+
+-- Link message constants (not used for external comms, but kept for consistency)
+local LINK_MSG_MARKER = 7777
+
+-- Operation IDs (from COMMS_PROTOCOL.md op table)
+local OP = {
+    REGISTER     = 1,
+    UNREGISTER   = 2,
+    STATE_POLL   = 3,
+    STATE_RESP   = 4,
+    META_REQ     = 5,
+    META_RESP    = 6,
+    TARGET_PUSH  = 7,
+    ADMIN_TARGET = 8,   -- Admin: set target bias (Main → Grid)
+    ADMIN_FORCE  = 9,   -- Admin: force/lock state (Main → Grid)
+    ADMIN_UNLOCK = 10,  -- Admin: release lock (Main → Grid)
+    ADMIN_DUMP   = 11,  -- Admin: dump state to owner chat (Main → Grid)
+    ADMIN_DEBUG  = 12,  -- Admin: toggle debug mode (Main → Grid)
+    BEACON       = 13,  -- Main → all grids: discovery broadcast with processor key
+}
+
+-- Recipient IDs (from COMMS_PROTOCOL.md recipient table)
+local RECIPIENT = {
+    MAIN  = 1,
+    PROC1 = 2,
+    PROC2 = 3,
+    PROC3 = 4,
+    GRID  = 5,
+}
+
+-- LSD key names (grid prim's own LSD)
+local LSD_KEY_CONFIG = "config"
+local LSD_KEY_STATE = "state"
+local LSD_KEY_TRANSITION = "transition"
+local LSD_KEY_PROCESSOR_KEY = "processor_key"  -- Discovered via beacon, not notecard
+
+-- Season names (ancient Egyptian calendar)
+local SEASON_AKHET = "Akhet"
+local SEASON_PERET = "Peret"
+local SEASON_SHEMU = "Shemu"
+
+-- Season date boundaries (month/day)
+local SEASON_AKHET_START_MONTH = 9
+local SEASON_AKHET_START_DAY = 11
+local SEASON_AKHET_END_MONTH = 1
+local SEASON_AKHET_END_DAY = 9
+local SEASON_PERET_START_MONTH = 1
+local SEASON_PERET_START_DAY = 10
+local SEASON_PERET_END_MONTH = 5
+local SEASON_PERET_END_DAY = 9
+
+-- Progression parameters (from SIMULATION_MATHS.md section 6)
+local PRESSURE_TREND_WINDOW_SECONDS = 300    -- 5-minute evaluation window
+local PRESSURE_HISTORY_RETENTION_SECONDS = 600  -- 10-minute retention
+local TRANSITION_COOLDOWN_CYCLES = 3         -- Cycles to wait after a transition
+
+-- Bootstrap evaluation thresholds (from SIMULATION_MATHS.md section 6)
+local BOOTSTRAP_DELTA_EVENT_HPA = -8   -- Pressure >8 hPa below baseline → event state
+local BOOTSTRAP_DELTA_CLOUDY_HPA = -5  -- Pressure >5 hPa below → Cloudy
+local BOOTSTRAP_DELTA_PARTLY_HPA = -2  -- Pressure >2 hPa below → Partly Cloudy
+local BOOTSTRAP_TREND_THRESHOLD = -0.2 -- hPa/min trend for event trigger
+
+-- Season blending
+local SEASON_BLEND_DAYS = 7  -- Last N days of season blend toward next
+
+-- Duration conversion
+local CYCLES_PER_HOUR = 120  -- At 30-second poll intervals, 1 hour = 120 cycles
+
+--================================================//
+
+--================== State ==================--
+
+-- Whether the notecard has been loaded into LSD
+local notecard_loaded: boolean = false
+
+-- Whether the grid has registered with Main
+local is_registered: boolean = false
+
+-- Whether this is the first poll after boot (for bootstrap evaluation)
+local is_first_poll: boolean = true
+
+-- Current poll timer handle
+local poll_timer_handler: any = nil
+
+-- Notecard parsing state (used during streaming load)
+local notecard_line_number: number = 0
+local notecard_total_lines: number = 0
+local notecard_query_id: string = ""
+local current_scope: string = ""  -- "grid", "season:Akhet", etc.
+local current_season: string = ""  -- "Akhet", "Peret", "Shemu"
+local current_state_name: string = ""  -- "Clear Skies", "Khamsin", etc.
+local current_state_params: any = {}  -- Accumulated key=value pairs for current state
+local current_grid_config: any = {}  -- Accumulated key=value pairs for grid section
+
+--================================================//
+
+--============= Forward Declarations ===========--
+-- These functions are defined later in the file but called from
+-- the notecard loader callback, which is defined before them.
+local register_with_main: () -> ()
+local start_polling: () -> ()
+
+--================================================//
+
+--================= Utilities =================--
+
+local function lsd_read(key_name: string): string
+    local value: string = ll.LinksetDataRead(key_name) or ""
+    return value
+end
+
+local function lsd_write(key_name: string, value: string): boolean
+    local result: number = ll.LinksetDataWrite(key_name, value)
+    return result == 0
+end
+
+local function lsd_delete(key_name: string): boolean
+    local result: number = ll.LinksetDataDelete(key_name)
+    return result == 0
+end
+
+local function lsd_read_json(key_name: string): any
+    local raw: string = lsd_read(key_name)
+    if raw == "" then
+        return nil
+    end
+    local success, decoded = pcall(lljson.decode, raw)
+    if not success then
+        return nil
+    end
+    return decoded
+end
+
+local function lsd_write_json(key_name: string, value: any): boolean
+    local encoded: string = lljson.encode(value)
+    return lsd_write(key_name, encoded)
+end
+
+local function json_decode_safe(json_string: string): any
+    local success, decoded = pcall(lljson.decode, json_string)
+    if not success then
+        return nil
+    end
+    return decoded
+end
+
+local function json_encode_safe(value: any): string
+    local success, encoded = pcall(lljson.encode, value)
+    if not success then
+        return ""
+    end
+    return encoded
+end
+
+-- Trim whitespace from both ends of a string.
+local function trim_string(s: string): string
+    return (string.gsub(s, "^%s*(.-)%s*$", "%1"))
+end
+
+-- Split a comma-separated string into a list of trimmed strings.
+local function split_comma_list(s: string): {string}
+    local result: {string} = {}
+    for part in string.gmatch(s, "[^,]+") do
+        table.insert(result, trim_string(part))
+    end
+    return result
+end
+
+--================================================//
+
+--=========== Season Determination ============--
+
+-- Determine the current season from month/day.
+-- Uses month/day comparison directly — leap years are handled naturally.
+local function get_current_season(month: number, day: number): string
+    -- Akhet: Sept 11 – Jan 9
+    if (month == SEASON_AKHET_START_MONTH and day >= SEASON_AKHET_START_DAY)
+       or month == 10 or month == 11 or month == 12
+       or (month == SEASON_AKHET_END_MONTH and day <= SEASON_AKHET_END_DAY) then
+        return SEASON_AKHET
+    end
+
+    -- Peret: Jan 10 – May 9
+    if (month == SEASON_PERET_START_MONTH and day >= SEASON_PERET_START_DAY)
+       or month == 2 or month == 3 or month == 4
+       or (month == SEASON_PERET_END_MONTH and day <= SEASON_PERET_END_DAY) then
+        return SEASON_PERET
+    end
+
+    -- Shemu: May 10 – Sept 10 (everything else)
+    return SEASON_SHEMU
+end
+
+-- Get the next season in the cycle.
+local function get_next_season(season: string): string
+    if season == SEASON_AKHET then return SEASON_PERET end
+    if season == SEASON_PERET then return SEASON_SHEMU end
+    return SEASON_AKHET
+end
+
+-- Get the current season from the SL date.
+local function get_season_from_sl_date(): string
+    local date_string: string = os.date("%Y-%m-%d")
+    local month: number = tonumber(string.sub(date_string, 6, 7)) or 1
+    local day: number = tonumber(string.sub(date_string, 9, 10)) or 1
+    return get_current_season(month, day)
+end
+
+--================================================//
+
+--========= Notecard Streaming Loader =========--
+
+-- Strip comments from a line (from # to end of line).
+local function strip_comment(line: string): string
+    local comment_start: number? = string.find(line, "#")
+    if comment_start then
+        return string.sub(line, 1, comment_start - 1)
+    end
+    return line
+end
+
+-- Parse a value string into the appropriate Lua type.
+local function parse_notecard_value(value_string: string): any
+    value_string = trim_string(value_string)
+
+    -- Boolean
+    if value_string == "true" then return true end
+    if value_string == "false" then return false end
+
+    -- Number (handles signed values like +15, -8, 0.3)
+    local numeric_value: number? = tonumber(value_string)
+    if numeric_value then
+        return numeric_value
+    end
+
+    -- Comma-separated list (for progresses_to, regresses_to, diverges_to)
+    if string.find(value_string, ",") then
+        return split_comma_list(value_string)
+    end
+
+    -- Plain string
+    return value_string
+end
+
+-- Determine if a line is a scope header: {grid: name} or {season: name}
+local function parse_scope_header(line: string): string, string
+    local scope_type, scope_name = string.match(line, "^{%s*(%w+)%s*:%s*(.+)%s*}$")
+    if scope_type and scope_name then
+        return scope_type, trim_string(scope_name)
+    end
+    return "", ""
+end
+
+-- Determine if a line is a state header: [State Name]
+local function parse_state_header(line: string): string
+    local state_name = string.match(line, "^%s*%[(.+)%]%s*$")
+    if state_name then
+        return trim_string(state_name)
+    end
+    return ""
+end
+
+-- Determine if a line is a key=value pair.
+local function parse_key_value(line: string): string, any
+    local key, value = string.match(line, "^%s*(%w[%w_]*)%s*=%s*(.+)$")
+    if key and value then
+        return trim_string(key), parse_notecard_value(value)
+    end
+    return "", nil
+end
+
+-- Write the current accumulated state params to LSD and reset the accumulator.
+local function flush_current_state(): ()
+    if current_state_name ~= "" and current_season ~= "" then
+        local lsd_key: string = current_season .. ":" .. current_state_name
+        lsd_write_json(lsd_key, current_state_params)
+    end
+    current_state_name = ""
+    current_state_params = {}
+end
+
+-- Write the current grid config to LSD.
+local function flush_grid_config(): ()
+    if current_grid_config and next(current_grid_config) then
+        lsd_write_json(LSD_KEY_CONFIG, current_grid_config)
+    end
+end
+
+-- Process one line of the notecard.
+local function process_notecard_line(raw_line: string): ()
+    local line: string = strip_comment(raw_line)
+    line = trim_string(line)
+
+    if line == "" then return end  -- Skip empty lines
+
+    -- Check for scope header: {grid: name} or {season: name}
+    local scope_type, scope_name = parse_scope_header(line)
+    if scope_type ~= "" then
+        -- Flush any pending state before changing scope
+        flush_current_state()
+
+        if scope_type == "grid" then
+            flush_grid_config()
+            current_scope = "grid"
+            current_season = ""
+        elseif scope_type == "season" then
+            current_scope = "season"
+            current_season = scope_name
+        end
+        return
+    end
+
+    -- Check for state header: [State Name]
+    local state_name: string = parse_state_header(line)
+    if state_name ~= "" then
+        -- Flush the previous state before starting a new one
+        flush_current_state()
+        current_state_name = state_name
+        current_state_params = {}
+        return
+    end
+
+    -- Check for key=value pair
+    local key, value = parse_key_value(line)
+    if key ~= "" then
+        if current_scope == "grid" then
+            current_grid_config[key] = value
+        elseif current_scope == "season" and current_state_name ~= "" then
+            current_state_params[key] = value
+        end
+        return
+    end
+end
+
+-- Start loading the notecard from the prim's inventory.
+local function start_notecard_load(): ()
+    notecard_total_lines = ll.GetNumberOfNotecardLines(NOTECARD_NAME)
+    notecard_line_number = 0
+    current_scope = ""
+    current_season = ""
+    current_state_name = ""
+    current_state_params = {}
+    current_grid_config = {}
+
+    -- Request the first line (async — dataserver event will deliver it)
+    notecard_query_id = ll.GetNotecardLine(NOTECARD_NAME, 0)
+end
+
+-- Handle a dataserver response with a notecard line.
+local function handle_notecard_line_data(query_id: string, data: string): ()
+    if query_id ~= notecard_query_id then return end
+
+    -- Process the received line (data is the line content, or EOF marker)
+    if data ~= "" then
+        process_notecard_line(data)
+    end
+
+    -- Advance to the next line
+    notecard_line_number = notecard_line_number + 1
+
+    if notecard_line_number < notecard_total_lines then
+        -- Request the next line
+        notecard_query_id = ll.GetNotecardLine(NOTECARD_NAME, notecard_line_number)
+    else
+        -- Notecard fully loaded — flush remaining state and config
+        flush_current_state()
+        flush_grid_config()
+        notecard_loaded = true
+        ll.OwnerSay("[" .. SCRIPT_ID .. "] Notecard loaded: " .. NOTECARD_NAME)
+
+        -- Check if we already have a processor key (from a beacon received
+        -- while the notecard was loading). If so, register now.
+        -- If not, the beacon handler will trigger registration when it arrives.
+        local processor_key: string = lsd_read(LSD_KEY_PROCESSOR_KEY)
+        if processor_key ~= "" then
+            register_with_main()
+            start_polling()
+        else
+            ll.OwnerSay("[" .. SCRIPT_ID .. "] Waiting for processor beacon to register...")
+        end
+    end
+end
+
+--================================================//
+
+--======== Target Parameter Extraction ========--
+
+-- Extract the flat target parameter set from a state definition.
+-- This is what gets sent to the processor via TARGET_PUSH.
+local function extract_targets_from_state(state_def: any): any
+    if not state_def then
+        return {}
+    end
+
+    return {
+        temp_base = state_def.temp_base,
+        temp_diurnal = state_def.temp_diurnal,
+        temp_phase = state_def.temp_phase,
+        humidity = state_def.humidity,
+        pressure = state_def.pressure,
+        wind_speed = state_def.wind_speed,
+        wind_dir = state_def.wind_dir,
+        wind_variability = state_def.wind_variability,
+        precipitation = state_def.precipitation,
+        dust = state_def.dust,
+        visibility = state_def.visibility,
+        eep_preset = state_def.eep_preset,
+        particle = state_def.particle,
+        -- Flood modifiers included so the processor can apply them
+        flood_peak_humidity = state_def.flood_peak_humidity,
+        flood_receding_humidity = state_def.flood_receding_humidity,
+        flood_low_dust = state_def.flood_low_dust,
+        flood_rising_humidity = state_def.flood_rising_humidity,
+    }
+end
+
+-- Get a state definition from LSD by season and state name.
+local function get_state_definition(season: string, state_name: string): any
+    return lsd_read_json(season .. ":" .. state_name)
+end
+
+--================================================//
+
+--======== Pressure History & Trend ===========--
+
+-- Record a pressure reading with a timestamp into the transition state.
+local function record_pressure_reading(transition_state: any, pressure: number): any
+    if not transition_state.pressure_history then
+        transition_state.pressure_history = {}
+    end
+
+    local current_time: number = os.time()
+    table.insert(transition_state.pressure_history, {ts = current_time, val = pressure})
+
+    -- Prune entries older than the retention window
+    local cutoff: number = current_time - PRESSURE_HISTORY_RETENTION_SECONDS
+    while #transition_state.pressure_history > 0 and transition_state.pressure_history[1].ts < cutoff do
+        table.remove(transition_state.pressure_history, 1)
+    end
+
+    return transition_state
+end
+
+-- Compute the time-windowed pressure trend (linear regression over the eval window).
+-- Returns hPa per minute.
+local function compute_pressure_trend(transition_state: any): number
+    if not transition_state.pressure_history then
+        return 0
+    end
+
+    local current_time: number = os.time()
+    local cutoff: number = current_time - PRESSURE_TREND_WINDOW_SECONDS
+
+    -- Filter to readings within the evaluation window
+    local recent: {{ts: number, val: number}} = {}
+    for _, entry in ipairs(transition_state.pressure_history) do
+        if entry.ts >= cutoff then
+            table.insert(recent, entry)
+        end
+    end
+
+    local entry_count: number = #recent
+    if entry_count < 2 then
+        return 0
+    end
+
+    -- Linear regression: timestamp vs pressure
+    local sum_x: number = 0
+    local sum_y: number = 0
+    local sum_xy: number = 0
+    local sum_x_squared: number = 0
+
+    for _, entry in ipairs(recent) do
+        sum_x = sum_x + entry.ts
+        sum_y = sum_y + entry.val
+        sum_xy = sum_xy + entry.ts * entry.val
+        sum_x_squared = sum_x_squared + entry.ts * entry.ts
+    end
+
+    local denominator: number = entry_count * sum_x_squared - sum_x * sum_x
+    if denominator == 0 then
+        return 0
+    end
+
+    local slope: number = (entry_count * sum_xy - sum_x * sum_y) / denominator
+    return slope * 60  -- Convert hPa/sec to hPa/min
+end
+
+--================================================//
+
+--======== Progression Evaluation =============--
+
+-- Default logic for each path type when not specified in the notecard.
+local PROGRESS_DEFAULT_LOGIC = "or"   -- Deterioration: either trend OR humidity can trigger
+local REGRESS_DEFAULT_LOGIC = "and"   -- Clearing: both trend AND humidity should confirm
+local DIVERGE_DEFAULT_LOGIC = "and"   -- Events: all conditions must align
+
+-- Check if a progression path's condition is met.
+-- Conditions are read from the current state's definition in the notecard,
+-- not hardcoded by state name. This makes the progression logic fully
+-- data-driven — adding or modifying states requires no code changes.
+--
+-- Condition fields (on the current state, prefixed by path type):
+--   progress_trend_max   — trigger if trend < this (negative = dropping)
+--   progress_humidity_min — trigger if humidity > this
+--   progress_logic       — "and" or "or" (default "or")
+--   regress_trend_min    — trigger if trend > this (positive = rising)
+--   regress_humidity_max — trigger if humidity < this
+--   regress_logic        — "and" or "or" (default "and")
+--   diverge_pressure_max — trigger if pressure < this (absolute, for events)
+--   diverge_trend_max    — trigger if trend < this (rapid drop)
+--   diverge_logic        — "and" or "or" (default "and")
+--
+-- path_type: "progress", "regress", or "diverge"
+-- current_state_def: the definition of the state we're transitioning FROM
+--   (this is where the condition fields live, alongside the progresses_to/regresses_to/diverges_to edges)
+-- local_trend: time-windowed pressure trend in hPa/min
+-- current_values: the latest computed values from STATE_RESP
+local function check_progression_condition(path_type: string, current_state_def: any, local_trend: number, current_values: any): boolean
+    local pressure: number = current_values.pressure or 1013
+    local humidity: number = current_values.humidity or 50
+
+    if path_type == "progress" then
+        local trend_threshold: number = current_state_def.progress_trend_max
+        local humidity_threshold: number = current_state_def.progress_humidity_min
+        local logic: string = current_state_def.progress_logic or PROGRESS_DEFAULT_LOGIC
+
+        -- If no condition fields are defined, the path never triggers
+        if not trend_threshold and not humidity_threshold then
+            return false
+        end
+
+        local trend_met: boolean = trend_threshold ~= nil and local_trend < trend_threshold
+        local humidity_met: boolean = humidity_threshold ~= nil and humidity > humidity_threshold
+
+        if logic == "and" then
+            -- Both conditions must be met (if both are defined)
+            local conditions: {boolean} = {}
+            if trend_threshold then table.insert(conditions, trend_met) end
+            if humidity_threshold then table.insert(conditions, humidity_met) end
+            for _, met in ipairs(conditions) do
+                if not met then return false end
+            end
+            return #conditions > 0
+        else
+            return trend_met or humidity_met
+        end
+
+    elseif path_type == "regress" then
+        local trend_threshold: number = current_state_def.regress_trend_min
+        local humidity_threshold: number = current_state_def.regress_humidity_max
+        local logic: string = current_state_def.regress_logic or REGRESS_DEFAULT_LOGIC
+
+        if not trend_threshold and not humidity_threshold then
+            return false
+        end
+
+        local trend_met: boolean = trend_threshold ~= nil and local_trend > trend_threshold
+        local humidity_met: boolean = humidity_threshold ~= nil and humidity < humidity_threshold
+
+        if logic == "or" then
+            return trend_met or humidity_met
+        else
+            local conditions: {boolean} = {}
+            if trend_threshold then table.insert(conditions, trend_met) end
+            if humidity_threshold then table.insert(conditions, humidity_met) end
+            for _, met in ipairs(conditions) do
+                if not met then return false end
+            end
+            return #conditions > 0
+        end
+
+    elseif path_type == "diverge" then
+        local pressure_threshold: number = current_state_def.diverge_pressure_max
+        local trend_threshold: number = current_state_def.diverge_trend_max
+        local logic: string = current_state_def.diverge_logic or DIVERGE_DEFAULT_LOGIC
+
+        if not pressure_threshold and not trend_threshold then
+            return false
+        end
+
+        local pressure_met: boolean = pressure_threshold ~= nil and pressure < pressure_threshold
+        local trend_met: boolean = trend_threshold ~= nil and local_trend < trend_threshold
+
+        if logic == "or" then
+            return pressure_met or trend_met
+        else
+            local conditions: {boolean} = {}
+            if pressure_threshold then table.insert(conditions, pressure_met) end
+            if trend_threshold then table.insert(conditions, trend_met) end
+            for _, met in ipairs(conditions) do
+                if not met then return false end
+            end
+            return #conditions > 0
+        end
+    end
+
+    return false
+end
+
+-- Gather all candidate paths from the current state definition.
+local function gather_progression_candidates(state_def: any): {{type: string, name: string}}
+    local candidates: {{type: string, name: string}} = {}
+
+    if state_def.progresses_to then
+        local names: any = state_def.progresses_to
+        if type(names) == "string" then
+            names = {names}
+        end
+        for _, name in ipairs(names) do
+            table.insert(candidates, {type = "progress", name = name})
+        end
+    end
+
+    if state_def.regresses_to then
+        local names: any = state_def.regresses_to
+        if type(names) == "string" then
+            names = {names}
+        end
+        for _, name in ipairs(names) do
+            table.insert(candidates, {type = "regress", name = name})
+        end
+    end
+
+    if state_def.diverges_to then
+        local names: any = state_def.diverges_to
+        if type(names) == "string" then
+            names = {names}
+        end
+        for _, name in ipairs(names) do
+            table.insert(candidates, {type = "diverge", name = name})
+        end
+    end
+
+    return candidates
+end
+
+-- Pick among multiple ready candidates using weight as tiebreaker.
+local function pick_among_ready(ready_candidates: {{def: any, name: string}}, season: string): any
+    local total_weight: number = 0
+    for _, cand in ipairs(ready_candidates) do
+        total_weight = total_weight + (cand.def.weight or 1)
+    end
+
+    local roll: number = math.random() * total_weight
+    local cumulative: number = 0
+    for _, cand in ipairs(ready_candidates) do
+        cumulative = cumulative + (cand.def.weight or 1)
+        if roll <= cumulative then
+            return cand.def
+        end
+    end
+
+    return ready_candidates[1].def
+end
+
+-- Evaluate progression for the current state.
+-- Returns the new state definition if a transition should occur, or nil to stay.
+local function evaluate_progression(current_state_def: any, season: string, current_values: any, transition_state: any): any
+    -- Don't transition if in cooldown
+    if transition_state.cooldown and transition_state.cooldown > 0 then
+        transition_state.cooldown = transition_state.cooldown - 1
+        return nil
+    end
+
+    -- Check for forced lock — if locked, no transitions
+    if transition_state.lock and transition_state.lock.locked then
+        -- Check if the lock has expired
+        local current_time: number = os.time()
+        if transition_state.lock.expires_at and current_time >= transition_state.lock.expires_at then
+            transition_state.lock = nil
+            -- Fall through to normal evaluation
+        else
+            return nil
+        end
+    end
+
+    -- Check for target bias expiry
+    local active_bias_target: string? = nil
+    local bias_threshold_multiplier: number = 1.0
+    local bias_weight_multiplier: number = 1.0
+    if transition_state.target_bias then
+        local current_time: number = os.time()
+        if transition_state.target_bias.expires_at and current_time >= transition_state.target_bias.expires_at then
+            -- Bias expired — clear it
+            transition_state.target_bias = nil
+        else
+            active_bias_target = transition_state.target_bias.target_state
+            bias_threshold_multiplier = transition_state.target_bias.threshold_multiplier or 1.0
+            bias_weight_multiplier = transition_state.target_bias.weight_multiplier or 1.0
+        end
+    end
+
+    -- Compute time-windowed trend
+    local local_trend: number = compute_pressure_trend(transition_state)
+
+    -- Gather all candidate paths
+    local candidates: {{type: string, name: string}} = gather_progression_candidates(current_state_def)
+
+    -- Check which candidates have their condition met
+    local ready: {{def: any, name: string}} = {}
+    for _, cand in ipairs(candidates) do
+        local def: any = get_state_definition(season, cand.name)
+        if def then
+            def._name = cand.name  -- Tag for display/debugging
+
+            -- Apply bias: if this candidate is the biased target, ease thresholds
+            -- by scaling the trend requirement down (closer to 0 = easier to trigger).
+            local effective_trend: number = local_trend
+            if active_bias_target and cand.name == active_bias_target then
+                effective_trend = local_trend * bias_threshold_multiplier
+            end
+
+            -- Conditions are read from the current state's definition (where the
+            -- progression edges are declared), not from the target state.
+            local condition_met: boolean = check_progression_condition(cand.type, current_state_def, effective_trend, current_values)
+            if condition_met then
+                -- Apply bias weight multiplier to the biased candidate
+                if active_bias_target and cand.name == active_bias_target then
+                    def.weight = (def.weight or 1) * bias_weight_multiplier
+                end
+                table.insert(ready, {def = def, name = cand.name})
+            end
+        end
+    end
+
+    -- If exactly one candidate is ready, transition to it
+    if #ready == 1 then
+        transition_state.cooldown = TRANSITION_COOLDOWN_CYCLES
+        transition_state.duration_timer = 0
+        return ready[1].def
+    end
+
+    -- If multiple candidates are ready, use weight as tiebreaker
+    if #ready > 1 then
+        local chosen: any = pick_among_ready(ready, season)
+        transition_state.cooldown = TRANSITION_COOLDOWN_CYCLES
+        transition_state.duration_timer = 0
+        return chosen
+    end
+
+    -- No candidates ready — check duration expiry
+    transition_state.duration_timer = (transition_state.duration_timer or 0) + 1
+    local duration_target: number = transition_state.duration_target or 999
+
+    if transition_state.duration_timer >= duration_target then
+        -- Duration expired — prefer regression, then progression
+        for _, cand in ipairs(candidates) do
+            if cand.type == "regress" then
+                local def: any = get_state_definition(season, cand.name)
+                if def then
+                    transition_state.cooldown = TRANSITION_COOLDOWN_CYCLES
+                    transition_state.duration_timer = 0
+                    return def
+                end
+            end
+        end
+        for _, cand in ipairs(candidates) do
+            if cand.type == "progress" then
+                local def: any = get_state_definition(season, cand.name)
+                if def then
+                    transition_state.cooldown = TRANSITION_COOLDOWN_CYCLES
+                    transition_state.duration_timer = 0
+                    return def
+                end
+            end
+        end
+    end
+
+    return nil
+end
+
+--================================================//
+
+--======== Bootstrap Evaluation ===============--
+
+-- On first poll after boot, check if conditions strongly indicate
+-- a state other than Clear Skies. If so, jump directly.
+local function bootstrap_evaluate(current_values: any, season: string): any
+    local pressure: number = current_values.pressure or 1013
+    local pressure_trend: number = current_values.pressure_trend or 0
+
+    local clear_skies: any = get_state_definition(season, "Clear Skies")
+    if not clear_skies then return nil end
+
+    local baseline_pressure: number = clear_skies.pressure or 1013
+    local delta: number = pressure - baseline_pressure
+
+    -- Rapid drop + very low pressure → event state
+    if delta < BOOTSTRAP_DELTA_EVENT_HPA and pressure_trend < BOOTSTRAP_TREND_THRESHOLD then
+        -- Find an event state in this season.
+        -- These are the known event states across all seasons.
+        -- Both have event=true in the notecard.
+        local event_names: {string} = {"Khamsin", "Storm"}
+        for _, name in ipairs(event_names) do
+            local def: any = get_state_definition(season, name)
+            if def and def.event then
+                def._name = name
+                return def
+            end
+        end
+    end
+
+    -- Moderate drop → Cloudy
+    if delta < BOOTSTRAP_DELTA_CLOUDY_HPA then
+        local cloudy: any = get_state_definition(season, "Cloudy")
+        if cloudy then return cloudy end
+    end
+
+    -- Slight drop → Partly Cloudy
+    if delta < BOOTSTRAP_DELTA_PARTLY_HPA then
+        local partly: any = get_state_definition(season, "Partly Cloudy")
+        if partly then return partly end
+    end
+
+    return nil  -- Stay in Clear Skies
+end
+
+--================================================//
+
+--=========== Duration Parsing ================--
+
+-- Parse a duration string like "4-9" into min and max hours.
+local function parse_duration(duration_str: string): number, number
+    local min_str, max_str = string.match(duration_str or "", "(%d+)%s*-%s*(%d+)")
+    if min_str and max_str then
+        return tonumber(min_str) or 1, tonumber(max_str) or 6
+    end
+
+    local single_str: string = string.match(duration_str or "", "(%d+)")
+    if single_str then
+        local single: number = tonumber(single_str) or 1
+        return single, single
+    end
+
+    return 1, 6  -- Default fallback
+end
+
+-- Pick a random duration within the range and convert to poll cycles.
+local function choose_duration_cycles(duration_str: string): number
+    local min_hours, max_hours = parse_duration(duration_str)
+    local chosen_hours: number = min_hours + math.random() * (max_hours - min_hours)
+    return math.floor(chosen_hours * CYCLES_PER_HOUR)
+end
+
+--================================================//
+
+--=========== Message Building ================--
+
+-- Get the processor object's key from LSD.
+-- Discovered at runtime via Main's periodic beacon broadcast,
+-- not hardcoded in the notecard (notecards are static inventory items).
+local function get_processor_key(): string
+    return lsd_read(LSD_KEY_PROCESSOR_KEY)
+end
+
+-- Build and send a message envelope to Main via llRegionSayTo.
+-- Targets the processor object's key (not self — a prim cannot hear itself).
+local function send_to_main(envelope: any): ()
+    local message: string = json_encode_safe(envelope)
+    if message == "" then
+        ll.OwnerSay("[" .. SCRIPT_ID .. "] ERROR: Failed to encode message to Main")
+        return
+    end
+
+    -- Echo to owner if debug mode is on
+    local transition_state: any = lsd_read_json(LSD_KEY_TRANSITION) or {}
+    if transition_state.debug_mode then
+        ll.OwnerSay("[" .. SCRIPT_ID .. "] DEBUG TX: " .. message)
+    end
+
+    local processor_key: string = get_processor_key()
+    if processor_key == "" then
+        ll.OwnerSay("[" .. SCRIPT_ID .. "] ERROR: processor_key not set in config. Cannot send to Main.")
+        return
+    end
+
+    ll.RegionSayTo(processor_key, COMMS_CHANNEL, message)
+end
+
+-- Send a REGISTER message to Main with config and initial targets.
+local function send_register(config: any, targets: any): ()
+    local envelope: any = {
+        o = {OP.REGISTER},
+        f = ll.GetKey() .. ":" .. SCRIPT_ID,
+        t = {RECIPIENT.MAIN},
+        p = {{ll.GetKey(), config, targets}},
+    }
+    send_to_main(envelope)
+end
+
+-- Send a STATE_POLL message to Main.
+local function send_state_poll(): ()
+    local envelope: any = {
+        o = {OP.STATE_POLL},
+        f = ll.GetKey() .. ":" .. SCRIPT_ID,
+        t = {RECIPIENT.MAIN},
+        p = {{ll.GetKey()}},
+    }
+    send_to_main(envelope)
+end
+
+-- Send a TARGET_PUSH message to Main with new target parameters.
+local function send_target_push(targets: any): ()
+    local envelope: any = {
+        o = {OP.TARGET_PUSH},
+        f = ll.GetKey() .. ":" .. SCRIPT_ID,
+        t = {RECIPIENT.MAIN},
+        p = {{ll.GetKey(), targets}},
+    }
+    send_to_main(envelope)
+end
+
+--================================================//
+
+--========= State Transition Handling =========--
+
+-- Handle a state transition: update transition state, push new targets.
+local function execute_state_transition(new_state_def: any, season: string, transition_state: any): ()
+    local new_state_name: string = new_state_def._name or "Unknown"
+
+    -- Update transition state
+    transition_state.current = new_state_name
+    transition_state.season = season
+    transition_state.cooldown = TRANSITION_COOLDOWN_CYCLES
+    transition_state.duration_timer = 0
+
+    -- Parse and set duration target
+    local duration_str: string = new_state_def.duration or "1-6"
+    transition_state.duration_target = choose_duration_cycles(duration_str)
+
+    -- Write transition state back to LSD
+    lsd_write_json(LSD_KEY_TRANSITION, transition_state)
+
+    -- Extract and push new targets to the processor
+    local targets: any = extract_targets_from_state(new_state_def)
+    send_target_push(targets)
+
+    -- Update the grid's runtime state with new EEP/particle info
+    local state: any = lsd_read_json(LSD_KEY_STATE) or {}
+    state.current_state = new_state_name
+    state.season = season
+    state.eep_preset = new_state_def.eep_preset or "none"
+    state.particle = new_state_def.particle or "none"
+    lsd_write_json(LSD_KEY_STATE, state)
+
+    ll.OwnerSay("[" .. SCRIPT_ID .. "] State transition: " .. new_state_name)
+end
+
+--================================================//
+
+--========= STATE_RESP Handling ===============--
+
+-- Process a STATE_RESP from the processor.
+-- Updates the grid's runtime state, records pressure, evaluates transitions.
+local function handle_state_resp(values: any, evolution: any): ()
+    local season: string = get_season_from_sl_date()
+
+    -- Read current transition state from LSD
+    local transition_state: any = lsd_read_json(LSD_KEY_TRANSITION) or {}
+    if not transition_state.current then
+        -- First boot — initialize to Clear Skies
+        transition_state.current = "Clear Skies"
+        transition_state.season = season
+        transition_state.pressure_history = {}
+        transition_state.duration_timer = 0
+        transition_state.cooldown = 0
+    end
+
+    -- Record pressure reading with timestamp
+    local current_pressure: number = values.pressure or 1013
+    transition_state = record_pressure_reading(transition_state, current_pressure)
+
+    -- Update the grid's runtime state with computed values
+    local state: any = lsd_read_json(LSD_KEY_STATE) or {}
+    state.current_state = transition_state.current
+    state.season = season
+    state.temp = values.temp
+    state.humidity = values.humidity
+    state.pressure = values.pressure
+    state.wind_speed = values.wind_speed
+    state.wind_dir = values.wind_dir
+    state.precipitation = values.precipitation
+    state.dust = values.dust
+    state.visibility = values.visibility
+    state.eep_preset = values.eep_preset
+    state.particle = values.particle
+    state.last_update = os.time()
+    lsd_write_json(LSD_KEY_STATE, state)
+
+    -- Bootstrap evaluation on first poll
+    if is_first_poll then
+        is_first_poll = false
+        local bootstrap_state: any = bootstrap_evaluate(values, season)
+        if bootstrap_state then
+            bootstrap_state._name = bootstrap_state._name or "Unknown"
+            -- Look up the actual state name from the season's states
+            -- For now, use the bootstrap result directly
+            execute_state_transition(bootstrap_state, season, transition_state)
+            return
+        end
+        -- No bootstrap transition needed — stay in Clear Skies
+        lsd_write_json(LSD_KEY_TRANSITION, transition_state)
+        return
+    end
+
+    -- Normal progression evaluation
+    local current_state_def: any = get_state_definition(season, transition_state.current)
+    if not current_state_def then
+        ll.OwnerSay("[" .. SCRIPT_ID .. "] WARNING: State definition not found: "
+            .. season .. ":" .. transition_state.current)
+        lsd_write_json(LSD_KEY_TRANSITION, transition_state)
+        return
+    end
+
+    local new_state_def: any = evaluate_progression(current_state_def, season, values, transition_state)
+
+    if new_state_def then
+        execute_state_transition(new_state_def, season, transition_state)
+    else
+        -- No transition — save the updated transition state (with new pressure reading)
+        lsd_write_json(LSD_KEY_TRANSITION, transition_state)
+    end
+end
+
+--================================================//
+
+--============ Polling Timer ==================--
+
+-- Start the polling timer with jitter.
+start_polling = function(): ()
+    local jitter: number = math.random(-POLL_JITTER_SECONDS, POLL_JITTER_SECONDS)
+    local interval: number = POLL_INTERVAL_SECONDS + jitter
+
+    poll_timer_handler = LLTimers:every(interval, function()
+        send_state_poll()
+    end)
+end
+
+--================================================//
+
+--============ Boot Sequence ==================--
+
+-- Register with Main: send config and Clear Skies targets for the current season.
+register_with_main = function(): ()
+    local config: any = lsd_read_json(LSD_KEY_CONFIG) or {}
+    local season: string = get_season_from_sl_date()
+
+    -- Get Clear Skies state definition for the current season
+    local clear_skies: any = get_state_definition(season, "Clear Skies")
+    if not clear_skies then
+        ll.OwnerSay("[" .. SCRIPT_ID .. "] ERROR: Clear Skies not found for season " .. season)
+        return
+    end
+
+    -- Extract initial targets
+    local initial_targets: any = extract_targets_from_state(clear_skies)
+
+    -- Initialize transition state
+    local transition_state: any = {
+        current = "Clear Skies",
+        season = season,
+        pressure_history = {},
+        duration_timer = 0,
+        duration_target = choose_duration_cycles(clear_skies.duration or "4-9"),
+        cooldown = 0,
+        lock = nil,
+        target_bias = nil,
+    }
+    lsd_write_json(LSD_KEY_TRANSITION, transition_state)
+
+    -- Initialize runtime state
+    local state: any = {
+        current_state = "Clear Skies",
+        season = season,
+        eep_preset = clear_skies.eep_preset or "none",
+        particle = clear_skies.particle or "none",
+        last_update = os.time(),
+    }
+    lsd_write_json(LSD_KEY_STATE, state)
+
+    -- Send REGISTER to Main
+    send_register(config, initial_targets)
+    is_registered = true
+
+    ll.OwnerSay("[" .. SCRIPT_ID .. "] Registered with Main. Season: " .. season .. ", initial state: Clear Skies")
+end
+
+-- Initialize the grid controller on script start.
+local function boot_grid_controller(): ()
+    -- Start listening on the comms channel immediately so we can hear
+    -- Main's discovery beacon, even before the notecard is loaded.
+    ll.Listen(COMMS_CHANNEL, "", nil, "")
+
+    -- Check if notecard data is already in LSD (from a previous boot)
+    local config: any = lsd_read_json(LSD_KEY_CONFIG)
+    if config and next(config) then
+        notecard_loaded = true
+        ll.OwnerSay("[" .. SCRIPT_ID .. "] Notecard data found in LSD. Skipping notecard load.")
+    else
+        -- Need to load the notecard from inventory
+        ll.OwnerSay("[" .. SCRIPT_ID .. "] Loading notecard: " .. NOTECARD_NAME)
+        start_notecard_load()
+        -- Registration will happen after notecard load completes AND
+        -- a beacon from Main is received (both conditions checked in
+        -- handle_notecard_line_data and the beacon handler respectively)
+        return
+    end
+
+    -- Notecard already loaded — check if we already know the processor key
+    local processor_key: string = lsd_read(LSD_KEY_PROCESSOR_KEY)
+    if processor_key ~= "" then
+        -- We have both notecard and processor key — register and start polling
+        register_with_main()
+        start_polling()
+    else
+        -- Notecard loaded but no processor key yet — wait for beacon
+        ll.OwnerSay("[" .. SCRIPT_ID .. "] Notecard loaded. Waiting for processor beacon...")
+    end
+end
+
+--================================================//
+
+--============ Admin Command Handling =========--
+
+-- Handle OP.ADMIN_TARGET: set target bias in the grid's transition LSD.
+local function handle_admin_target(target_state: string, threshold_multiplier: number, weight_multiplier: number, expiry_minutes: number): ()
+    local transition: any = lsd_read_json(LSD_KEY_TRANSITION) or {}
+    transition.target_bias = {
+        target_state = target_state,
+        threshold_multiplier = threshold_multiplier,
+        weight_multiplier = weight_multiplier,
+        set_at = os.time(),
+        expires_at = os.time() + (expiry_minutes * 60),
+    }
+    lsd_write_json(LSD_KEY_TRANSITION, transition)
+    ll.OwnerSay("[" .. SCRIPT_ID .. "] Target bias set: " .. target_state
+        .. " (expires in " .. tostring(expiry_minutes) .. " min)")
+end
+
+-- Handle OP.ADMIN_FORCE: force-lock the grid into a specific state.
+local function handle_admin_force(forced_state: string, lock_duration_minutes: number): ()
+    local transition: any = lsd_read_json(LSD_KEY_TRANSITION) or {}
+    transition.lock = {
+        locked = true,
+        forced_state = forced_state,
+        locked_at = os.time(),
+        expires_at = os.time() + (lock_duration_minutes * 60),
+    }
+    transition.current = forced_state
+    lsd_write_json(LSD_KEY_TRANSITION, transition)
+
+    -- Also update the runtime state
+    local state: any = lsd_read_json(LSD_KEY_STATE) or {}
+    state.current_state = forced_state
+    lsd_write_json(LSD_KEY_STATE, state)
+
+    ll.OwnerSay("[" .. SCRIPT_ID .. "] Force locked: " .. forced_state
+        .. " for " .. tostring(lock_duration_minutes) .. " min")
+end
+
+-- Handle OP.ADMIN_UNLOCK: release a forced lock early.
+local function handle_admin_unlock(): ()
+    local transition: any = lsd_read_json(LSD_KEY_TRANSITION) or {}
+    transition.lock = nil
+    lsd_write_json(LSD_KEY_TRANSITION, transition)
+    ll.OwnerSay("[" .. SCRIPT_ID .. "] Lock released")
+end
+
+-- Handle OP.ADMIN_DUMP: dump current state to owner chat.
+local function handle_admin_dump(): ()
+    local state: any = lsd_read_json(LSD_KEY_STATE) or {}
+    local transition: any = lsd_read_json(LSD_KEY_TRANSITION) or {}
+
+    ll.OwnerSay("[" .. SCRIPT_ID .. "] === DUMP ===")
+    ll.OwnerSay("  State: " .. tostring(state.current_state or "unknown"))
+    ll.OwnerSay("  Season: " .. tostring(state.season or "unknown"))
+    ll.OwnerSay("  Temp: " .. tostring(state.temp or "?"))
+    ll.OwnerSay("  Humidity: " .. tostring(state.humidity or "?"))
+    ll.OwnerSay("  Pressure: " .. tostring(state.pressure or "?"))
+    ll.OwnerSay("  Wind: " .. tostring(state.wind_speed or "?") .. " @ " .. tostring(state.wind_dir or "?"))
+    ll.OwnerSay("  Dust: " .. tostring(state.dust or "?"))
+    ll.OwnerSay("  Visibility: " .. tostring(state.visibility or "?"))
+    ll.OwnerSay("  EEP: " .. tostring(state.eep_preset or "none"))
+    ll.OwnerSay("  Particle: " .. tostring(state.particle or "none"))
+
+    if transition.target_bias then
+        ll.OwnerSay("  Target bias: " .. tostring(transition.target_bias.target_state))
+    end
+    if transition.lock and transition.lock.locked then
+        ll.OwnerSay("  Locked: " .. tostring(transition.lock.forced_state))
+    end
+    if transition.pressure_history then
+        ll.OwnerSay("  Pressure history entries: " .. tostring(#transition.pressure_history))
+    end
+    ll.OwnerSay("  === END DUMP ===")
+end
+
+-- Handle OP.ADMIN_DEBUG: toggle debug mode.
+local function handle_admin_debug(enable_debug: boolean): ()
+    local transition: any = lsd_read_json(LSD_KEY_TRANSITION) or {}
+    transition.debug_mode = enable_debug
+    lsd_write_json(LSD_KEY_TRANSITION, transition)
+    ll.OwnerSay("[" .. SCRIPT_ID .. "] Debug mode " .. (enable_debug and "ON" or "OFF"))
+end
+
+--================================================//
+
+--=============== Events =======================--
+
+-- Listen for messages from Main on the comms channel.
+LLEvents:on("listen", function(channel: number, name: string, sender_uuid: string, message: string)
+    if channel ~= COMMS_CHANNEL then return end
+
+    local envelope: any = json_decode_safe(message)
+    if not envelope then
+        return
+    end
+
+    -- Check if debug mode is enabled
+    local transition_state: any = lsd_read_json(LSD_KEY_TRANSITION) or {}
+    local debug_mode: boolean = transition_state.debug_mode or false
+
+    if debug_mode then
+        ll.OwnerSay("[" .. SCRIPT_ID .. "] DEBUG RX: " .. message)
+    end
+
+    local ops: {number} = envelope.o or {}
+    local payloads: {any} = envelope.p or {}
+
+    for i, op_id in ipairs(ops) do
+        local payload: any = payloads[i] or {}
+
+        if op_id == OP.BEACON then
+            -- Discovery beacon from Main: store the processor key
+            local discovered_processor_key: string = payload[1]
+            if discovered_processor_key and discovered_processor_key ~= "" then
+                local current_key: string = lsd_read(LSD_KEY_PROCESSOR_KEY)
+                if current_key ~= discovered_processor_key then
+                    lsd_write(LSD_KEY_PROCESSOR_KEY, discovered_processor_key)
+                    ll.OwnerSay("[" .. SCRIPT_ID .. "] Processor discovered: " .. discovered_processor_key)
+                end
+                -- If notecard is loaded but we haven't registered yet, do so now
+                if notecard_loaded and not is_registered then
+                    register_with_main()
+                    start_polling()
+                end
+            end
+
+        elseif op_id == OP.STATE_RESP then
+            local values: any = payload[2]
+            local evolution: any = payload[3]
+            handle_state_resp(values, evolution)
+
+        elseif op_id == OP.META_REQ then
+            -- Future: respond to metadata requests from procs
+            local method: string = payload[1]
+            ll.OwnerSay("[" .. SCRIPT_ID .. "] Received META_REQ: " .. method .. " (not yet implemented)")
+
+        elseif op_id == OP.ADMIN_TARGET then
+            local target_state: string = payload[1]
+            local threshold_multiplier: number = payload[2]
+            local weight_multiplier: number = payload[3]
+            local expiry_minutes: number = payload[4]
+            handle_admin_target(target_state, threshold_multiplier, weight_multiplier, expiry_minutes)
+
+        elseif op_id == OP.ADMIN_FORCE then
+            local forced_state: string = payload[1]
+            local lock_duration_minutes: number = payload[2]
+            handle_admin_force(forced_state, lock_duration_minutes)
+
+        elseif op_id == OP.ADMIN_UNLOCK then
+            handle_admin_unlock()
+
+        elseif op_id == OP.ADMIN_DUMP then
+            handle_admin_dump()
+
+        elseif op_id == OP.ADMIN_DEBUG then
+            local enable_debug: boolean = payload[1]
+            handle_admin_debug(enable_debug)
+
+        else
+            -- Other ops are not expected by the grid in this phase
+        end
+    end
+end)
+
+-- Dataserver event: handles async notecard line delivery.
+LLEvents:on("dataserver", function(request_id: string, data: string)
+    handle_notecard_line_data(request_id, data)
+end)
+
+-- Linkset data event: stub for future use.
+LLEvents:on("linkset_data", function(action: number, name: string, value: string)
+    -- Future: react to external LSD changes.
+end)
+
+--================================================//
+
+-- Boot on script load.
+boot_grid_controller()

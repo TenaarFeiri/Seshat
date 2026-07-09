@@ -1,0 +1,332 @@
+--!strict
+--
+-- Proc1 (Core/Macro) script for the Seshat Weather System.
+-- Handles macro-level compute: evolves macro state (relaxation metadata, pressure
+-- trends) and assembles STATE_RESP messages when grids poll for results.
+--
+-- Proc1 round-robins through the grids registry on a 15-second cadence, evolving
+-- one grid per cycle. It also responds to STATE_POLL link messages from Main
+-- by reading the namespace and sending STATE_RESP back via link message.
+--
+-- See Documentation/DESIGN.md and Documentation/SIMULATION_MATHS.md
+-- for architecture and math details.
+--
+
+--================== Constants ==================--
+
+local SCRIPT_ID = "PROC1"
+
+-- Compute cadence: how often Proc1 processes one grid in the round-robin (seconds)
+local COMPUTE_INTERVAL_SECONDS = 15
+
+-- Link message constants (must match Main)
+local LINK_MSG_MARKER = 7777
+local LINK_ALL_SCRIPTS = -1
+
+-- Operation IDs (from COMMS_PROTOCOL.md op table)
+local OP = {
+    REGISTER     = 1,
+    UNREGISTER   = 2,
+    STATE_POLL   = 3,
+    STATE_RESP   = 4,
+    META_REQ     = 5,
+    META_RESP    = 6,
+    TARGET_PUSH  = 7,
+    ADMIN_TARGET = 8,
+    ADMIN_FORCE  = 9,
+    ADMIN_UNLOCK = 10,
+    ADMIN_DUMP   = 11,
+    ADMIN_DEBUG  = 12,
+}
+
+-- Recipient IDs (from COMMS_PROTOCOL.md recipient table)
+local RECIPIENT = {
+    MAIN  = 1,
+    PROC1 = 2,
+    PROC2 = 3,
+    PROC3 = 4,
+    GRID  = 5,
+}
+
+-- LSD key names
+local LSD_KEY_GRIDS = "grids"
+local LSD_KEY_DRIVERS_PRESSURE = "drivers:pressure"
+
+-- Relaxation model parameters (from SIMULATION_MATHS.md section 2)
+local RELAXATION_RATE = 0.1       -- How fast values drift toward targets (0-1)
+local NOISE_SCALE = 0.05          -- Stochastic perturbation scale
+
+--================================================//
+
+--================== State ==================--
+
+-- Round-robin index: which grid in the registry we process next
+local round_robin_index: number = 1
+
+--================================================//
+
+--================= Utilities =================--
+
+-- Read a raw string from LSD.
+local function lsd_read(key_name: string): string
+    local value: string = ll.LinksetDataRead(key_name) or ""
+    return value
+end
+
+-- Write a string to LSD.
+local function lsd_write(key_name: string, value: string): boolean
+    local result: number = ll.LinksetDataWrite(key_name, value)
+    return result == 0
+end
+
+-- Read and decode JSON from LSD.
+local function lsd_read_json(key_name: string): any
+    local raw: string = lsd_read(key_name)
+    if raw == "" then
+        return nil
+    end
+    local success, decoded = pcall(lljson.decode, raw)
+    if not success then
+        return nil
+    end
+    return decoded
+end
+
+-- Encode to JSON and write to LSD.
+local function lsd_write_json(key_name: string, value: any): boolean
+    local encoded: string = lljson.encode(value)
+    return lsd_write(key_name, encoded)
+end
+
+-- Safely decode a JSON string.
+local function json_decode_safe(json_string: string): any
+    local success, decoded = pcall(lljson.decode, json_string)
+    if not success then
+        return nil
+    end
+    return decoded
+end
+
+-- Safely encode a value to JSON.
+local function json_encode_safe(value: any): string
+    local success, encoded = pcall(lljson.encode, value)
+    if not success then
+        return ""
+    end
+    return encoded
+end
+
+-- Get the list of registered grid UUIDs from LSD.
+local function get_registered_grids(): {string}
+    local raw: string = lsd_read(LSD_KEY_GRIDS)
+    if raw == "" then
+        return {}
+    end
+    local grids: {string} = {}
+    for uuid in string.gmatch(raw, "[^,]+") do
+        table.insert(grids, uuid)
+    end
+    return grids
+end
+
+--================================================//
+
+--============ Macro Evolution ================--
+
+-- Evolve the macro state for a single grid.
+-- Proc1 owns <grid_uuid>:macro:evolution, which holds relaxation metadata
+-- and the pressure trend exposed to the grid via STATE_RESP.
+local function evolve_grid_macro(grid_uuid: string): ()
+    local evolution_key: string = grid_uuid .. ":macro:evolution"
+    local targets_key: string = grid_uuid .. ":targets"
+
+    -- Read current evolution state and targets
+    local evolution: any = lsd_read_json(evolution_key) or {}
+    local targets: any = lsd_read_json(targets_key) or {}
+
+    -- Read the background pressure driver from Proc3
+    local pressure_driver: any = lsd_read_json(LSD_KEY_DRIVERS_PRESSURE) or {}
+    local driver_trend: number = pressure_driver.trend or 0
+    local driver_offset: number = pressure_driver.offset or 0
+
+    -- Update the evolution state with the driver trend and offset.
+    -- The grid reads these via STATE_RESP to cross-check against its own
+    -- time-windowed trend computation.
+    evolution.pressure_trend = driver_trend
+    evolution.pressure_driver_offset = driver_offset
+
+    -- Keep relaxation parameters in the evolution state for reference
+    evolution.rate = RELAXATION_RATE
+    evolution.noise_scale = NOISE_SCALE
+
+    -- Write the updated evolution state back to LSD
+    lsd_write_json(evolution_key, evolution)
+end
+
+-- Process one grid in the round-robin cycle.
+local function process_next_grid_in_round_robin(): ()
+    local registered_grids: {string} = get_registered_grids()
+    local grid_count: number = #registered_grids
+
+    if grid_count == 0 then
+        return  -- Nothing to do
+    end
+
+    -- Wrap the index if it's past the end of the list
+    if round_robin_index > grid_count then
+        round_robin_index = 1
+    end
+
+    local grid_uuid: string = registered_grids[round_robin_index]
+    evolve_grid_macro(grid_uuid)
+
+    -- Advance to the next grid for the next cycle
+    round_robin_index = round_robin_index + 1
+end
+
+--================================================//
+
+--========== STATE_POLL Handling ==============--
+
+-- Assemble the STATE_RESP payload for a grid.
+-- Reads macro:evolution (owned by Proc1) and all micro:* keys (owned by Proc2),
+-- plus the pressure driver trend, and packages them into the response.
+local function assemble_state_response(grid_uuid: string): any
+    -- Read macro evolution state (written by Proc1)
+    local evolution: any = lsd_read_json(grid_uuid .. ":macro:evolution") or {}
+
+    -- Read all micro values (written by Proc2)
+    local micro_temp: any = lsd_read_json(grid_uuid .. ":micro:temp") or {}
+    local micro_humidity: any = lsd_read_json(grid_uuid .. ":micro:humidity") or {}
+    local micro_pressure: any = lsd_read_json(grid_uuid .. ":micro:pressure") or {}
+    local micro_wind_speed: any = lsd_read_json(grid_uuid .. ":micro:wind_speed") or {}
+    local micro_wind_dir: any = lsd_read_json(grid_uuid .. ":micro:wind_dir") or {}
+    local micro_precipitation: any = lsd_read_json(grid_uuid .. ":micro:precipitation") or {}
+    local micro_dust: any = lsd_read_json(grid_uuid .. ":micro:dust") or {}
+    local micro_visibility: any = lsd_read_json(grid_uuid .. ":micro:visibility") or {}
+    local micro_eep: any = lsd_read_json(grid_uuid .. ":micro:eep") or {}
+    local micro_particle: any = lsd_read_json(grid_uuid .. ":micro:particle") or {}
+
+    -- Assemble the values object that the grid expects
+    local values: any = {
+        temp = micro_temp.current,
+        humidity = micro_humidity.current,
+        pressure = micro_pressure.current,
+        wind_speed = micro_wind_speed.current,
+        wind_dir = micro_wind_dir.current,
+        precipitation = micro_precipitation.current,
+        dust = micro_dust.current,
+        visibility = micro_visibility.current,
+        eep_preset = micro_eep.preset,
+        particle = micro_particle.preset,
+    }
+
+    -- Assemble the evolution object (driver trend for grid cross-checking)
+    local evolution_data: any = {
+        pressure_trend = evolution.pressure_trend or 0,
+        pressure_driver_offset = evolution.pressure_driver_offset or 0,
+    }
+
+    return {
+        grid_uuid = grid_uuid,
+        values = values,
+        evolution = evolution_data,
+    }
+end
+
+-- Handle a STATE_POLL link message from Main.
+-- Assembles the response and sends STATE_RESP back to Main via link message.
+local function handle_state_poll(grid_uuid: string): ()
+    local response: any = assemble_state_response(grid_uuid)
+
+    local envelope: any = {
+        o = {OP.STATE_RESP},
+        f = ll.GetKey() .. ":" .. SCRIPT_ID,
+        t = {RECIPIENT.MAIN},
+        p = {{response.grid_uuid, response.values, response.evolution}},
+    }
+
+    local message: string = json_encode_safe(envelope)
+    if message == "" then
+        ll.OwnerSay("[" .. SCRIPT_ID .. "] ERROR: Failed to encode STATE_RESP for " .. grid_uuid)
+        return
+    end
+
+    ll.MessageLinked(LINK_ALL_SCRIPTS, LINK_MSG_MARKER, message, "")
+end
+
+--================================================//
+
+--========= Link Message Dispatch ==============--
+
+-- Process an inbound link message envelope from Main.
+local function process_link_message(envelope: any): ()
+    local ops: {number} = envelope.o or {}
+    local payloads: {any} = envelope.p or {}
+    local recipients: {number} = envelope.t or {}
+
+    -- Check if this message is intended for Proc1
+    local is_for_proc1: boolean = false
+    for _, recipient_id in ipairs(recipients) do
+        if recipient_id == RECIPIENT.PROC1 then
+            is_for_proc1 = true
+            break
+        end
+    end
+
+    if not is_for_proc1 then
+        return  -- Not for us
+    end
+
+    for i, op_id in ipairs(ops) do
+        local payload: any = payloads[i] or {}
+
+        if op_id == OP.STATE_POLL then
+            local grid_uuid: string = payload[1]
+            handle_state_poll(grid_uuid)
+        else
+            -- Other ops are not expected by Proc1 in this phase
+        end
+    end
+end
+
+--================================================//
+
+--============ Boot Sequence ==================--
+
+-- Initialize Proc1 on script start.
+local function boot_proc1(): ()
+    -- Start the round-robin compute timer
+    LLTimers:every(COMPUTE_INTERVAL_SECONDS, function()
+        process_next_grid_in_round_robin()
+    end)
+
+    ll.OwnerSay("[" .. SCRIPT_ID .. "] Proc1 is ready. Round-robin every "
+        .. tostring(COMPUTE_INTERVAL_SECONDS) .. "s.")
+end
+
+--================================================//
+
+--=============== Events =======================--
+
+-- Listen for link messages from Main.
+LLEvents:on("link_message", function(sender_num: number, num: number, str: string, id: string)
+    if num ~= LINK_MSG_MARKER then return end
+
+    local envelope: any = json_decode_safe(str)
+    if not envelope then
+        return
+    end
+
+    process_link_message(envelope)
+end)
+
+-- Linkset data event: stub for future use.
+LLEvents:on("linkset_data", function(action: number, name: string, value: string)
+    -- Future: react to changes in grids registry or reset_mode.
+end)
+
+--================================================//
+
+-- Boot on script load.
+boot_proc1()
