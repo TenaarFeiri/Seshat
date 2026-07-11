@@ -19,7 +19,7 @@
 local SCRIPT_ID = "PROC2"
 
 -- Compute cadence: how often Proc2 processes one grid in the round-robin (seconds)
-local COMPUTE_INTERVAL_SECONDS = 15
+local COMPUTE_INTERVAL_SECONDS = 7.5
 
 -- Link message constants (must match Main)
 local LINK_MSG_MARKER = 7777
@@ -53,16 +53,24 @@ local RECIPIENT = {
 local LSD_KEY_GRIDS = "grids"
 local LSD_KEY_DRIVERS_FLOOD_STATE = "drivers:flood_state"
 local LSD_KEY_DRIVERS_PRESSURE = "drivers:pressure"
+local LSD_KEY_DRIVERS_WIND = "drivers:wind"
+local LSD_KEY_DRIVERS_CONDITIONS = "drivers:conditions"
+
+-- Target interpolation state (for smooth state transitions)
+-- When targets change, Proc2 interpolates from old to new over the ramp period
+local interp_old_targets: any = nil       -- Previous targets (before change)
+local interp_new_targets: any = nil       -- New targets (what we're ramping to)
+local interp_ramp_remaining: number = 0   -- Cycles remaining in interpolation
+local interp_ramp_total: number = 0       -- Total ramp cycles
+local interp_last_target_signature: string = ""  -- Detects target changes
 
 -- Relaxation model parameters (from SIMULATION_MATHS.md section 2)
-local RELAXATION_RATE = 0.1        -- How fast values drift toward targets (0-1 per cycle)
+local RELAXATION_RATE = 0.05       -- How fast values drift toward targets (0-1 per cycle)
 local NOISE_SCALE_DEFAULT = 0.05   -- Default stochastic perturbation scale
 
 -- Diurnal temperature parameters (from SIMULATION_MATHS.md section 3)
 local TWO_PI = 2 * math.pi
 local HOURS_PER_DAY = 24
-local SECONDS_PER_HOUR = 3600
-local SL_DAY_CYCLE_SECONDS = 13 * SECONDS_PER_HOUR  -- Sim's day cycle length (13 hours)
 
 -- Wind direction: cardinal to degrees mapping (from SIMULATION_MATHS.md section 3)
 local CARDINAL_TO_DEGREES: { [string]: number } = {
@@ -83,8 +91,10 @@ local FLOOD_STATE_RECEDING = "receding"
 -- direction (continental/desert), temperature is warmed and humidity is
 -- reduced. The effect is proportional to the cosine of the angular
 -- difference between wind direction and sea direction.
-local SEA_TEMP_MODIFIER = 3.0       -- °C at full alignment (from sea)
-local SEA_HUMIDITY_MODIFIER = 10.0  -- percentage points at full alignment
+-- Grid-specific overrides can be set in the {grid} section of the notecard
+-- via sea_temp_modifier and sea_humidity_modifier.
+local DEFAULT_SEA_TEMP_MODIFIER = 1.0       -- °C at full alignment (from sea)
+local DEFAULT_SEA_HUMIDITY_MODIFIER = 8.0   -- percentage points at full alignment
 
 --================================================//
 
@@ -155,17 +165,29 @@ end
 
 -- Compute the diurnal temperature for a grid based on sun position.
 -- temp = temp_base + temp_diurnal * sin(sun_angle - phase_offset)
--- The sun angle is derived from ll.GetTimeOfDay(), which returns seconds
--- since SL midnight per the parcel's day cycle settings. We map the SL day
--- fraction to a 24-hour equivalent so temp_phase (e.g. 14 = 2pm) works as
--- a familiar 24-hour clock hour regardless of the actual day cycle length.
+-- The time of day is derived from ll.GetSunDirection(), which returns a
+-- normalized vector pointing toward the sun. This is immune to region
+-- restart desync (unlike ll.GetTimeOfDay) and naturally follows any
+-- jitter in the day-night cycle length.
+--
+-- SL sun path: rises in the east (+X), sets in the west (-X), arcs
+-- through the sky (+Z at noon, -Z at midnight). We use atan2(z, x) to
+-- get the orbital angle, then map to a 24-hour clock so temp_phase
+-- values (e.g. 14 = 2pm) work as familiar hours.
 local function compute_diurnal_temperature(temp_base: number, temp_diurnal: number, temp_phase: number): number
-    -- Get the current SL time of day as a fraction of the day cycle (0-1)
-    local sl_seconds: number = ll.GetTimeOfDay()
-    local day_fraction: number = (sl_seconds % SL_DAY_CYCLE_SECONDS) / SL_DAY_CYCLE_SECONDS
+    -- Get the sun direction vector (parcel-scoped)
+    local sun: vector = ll.GetSunDirection()
 
-    -- Map to a 24-hour equivalent so temp_phase values (e.g. 14 = 2pm) are intuitive
-    local time_of_day_hours: number = day_fraction * HOURS_PER_DAY
+    -- Derive the orbital angle from the sun's X-Z position.
+    -- atan2(z, x) gives: 0 at sunrise (east), π/2 at noon, π at sunset (west),
+    -- 3π/2 at midnight. We normalize to [0, 2π).
+    local angle: number = math.atan(sun.z, sun.x)
+    if angle < 0 then
+        angle = angle + TWO_PI
+    end
+
+    -- Map angle to 24-hour clock: sunrise (angle=0) = 6am, noon = 12, sunset = 18, midnight = 0
+    local time_of_day_hours: number = (6 + (angle / TWO_PI) * HOURS_PER_DAY) % HOURS_PER_DAY
 
     -- Convert to angular position (0 at midnight, pi at noon)
     local sun_angle: number = (time_of_day_hours / HOURS_PER_DAY) * TWO_PI
@@ -274,8 +296,46 @@ end
 -- This is the core compute function — reads targets, reads drivers, applies
 -- relaxation + noise + diurnal + flood modifiers + pressure driver, writes results.
 local function evolve_grid_micro(grid_uuid: string): ()
-    local targets: any = lsd_read_json(grid_uuid .. ":targets") or {}
+    local raw_targets: any = lsd_read_json(grid_uuid .. ":targets") or {}
     local meta: any = lsd_read_json(grid_uuid .. ":meta") or {}
+
+    -- Detect target changes and start interpolation ramp
+    -- Create a signature from key target fields to detect changes
+    local target_sig: string = tostring(raw_targets.temp_base) .. ":" .. tostring(raw_targets.humidity)
+        .. ":" .. tostring(raw_targets.pressure) .. ":" .. tostring(raw_targets.dust)
+        .. ":" .. tostring(raw_targets.visibility) .. ":" .. tostring(raw_targets.wind_speed_mod)
+        .. ":" .. tostring(raw_targets.wind_dir_mod)
+    if target_sig ~= interp_last_target_signature and interp_last_target_signature ~= "" then
+        -- Targets changed — start interpolation
+        interp_old_targets = interp_new_targets or raw_targets
+        interp_new_targets = raw_targets
+        local ramp_seconds: number = raw_targets.wind_ramp_seconds or 300
+        local ramp_cycles: number = math.floor(ramp_seconds / COMPUTE_INTERVAL_SECONDS)
+        if ramp_cycles < 2 then ramp_cycles = 2 end
+        interp_ramp_remaining = ramp_cycles
+        interp_ramp_total = ramp_cycles
+    end
+    interp_last_target_signature = target_sig
+
+    -- Compute effective targets (interpolated during ramp, otherwise raw)
+    local targets: any = raw_targets
+    if interp_ramp_remaining > 0 and interp_old_targets and interp_new_targets then
+        local progress: number = 1.0 - (interp_ramp_remaining / interp_ramp_total)
+        local function lerp(old: any, new: any): number
+            local o: number = tonumber(old) or 0
+            local n: number = tonumber(new) or 0
+            return o + (n - o) * progress
+        end
+        targets = {}
+        for k, v in pairs(raw_targets) do
+            if type(v) == "number" and interp_old_targets[k] ~= nil then
+                targets[k] = lerp(interp_old_targets[k], v)
+            else
+                targets[k] = v
+            end
+        end
+        interp_ramp_remaining = interp_ramp_remaining - 1
+    end
 
     -- Read current micro values (or initialize from targets if first cycle)
     local micro_temp: any = lsd_read_json(grid_uuid .. ":micro:temp") or {}
@@ -293,23 +353,60 @@ local function evolve_grid_micro(grid_uuid: string): ()
     local flood_state: string = get_current_flood_state()
     local nile_adjacent: boolean = meta.nile_adjacent or false
 
-    -- Read variability from targets for noise scaling
+    -- Read variability from targets for noise scaling (used for non-wind values)
     local wind_variability: number = targets.wind_variability or 0.3
 
-    -- ===== Temperature (diurnal, not relaxed — computed directly) =====
+    -- ===== Wind (from Proc3 driver, not relaxed locally) =====
+    -- Proc3 computes wind speed and direction as a global environmental driver.
+    -- Proc2 reads the driver and uses it directly. Maritime influence is still
+    -- applied here since it depends on the grid's sea_direction (which is per-grid).
+    local wind_driver: any = lsd_read_json(LSD_KEY_DRIVERS_WIND)
+    local computed_wind_dir: number
+    local computed_wind_speed: number
+    if wind_driver then
+        computed_wind_dir = wind_driver.direction or 0
+        computed_wind_speed = wind_driver.speed or 0
+    else
+        -- Fallback: use targets if driver not yet available (cold boot)
+        computed_wind_dir = cardinal_to_degrees(targets.wind_dir or "N")
+        computed_wind_speed = targets.wind_speed or 10
+    end
+
+    -- ===== Maritime influence (wind direction → target adjustment) =====
+    -- Wind from the sea cools and humidifies; wind from inland heats and dries.
+    -- The maritime factor modifies the RELAXATION TARGET, not the computed value.
+    -- This way the relaxation model naturally incorporates the maritime effect,
+    -- and values vary smoothly with wind direction — no cap needed.
+    local sea_direction: any = meta.sea_direction
+    local maritime: number = compute_maritime_influence(computed_wind_dir, sea_direction)
+
+    -- Grid-specific maritime modifier overrides (defaults in constants above)
+    local sea_temp_modifier: number = meta.sea_temp_modifier or DEFAULT_SEA_TEMP_MODIFIER
+    local sea_humidity_modifier: number = meta.sea_humidity_modifier or DEFAULT_SEA_HUMIDITY_MODIFIER
+
+    -- ===== Temperature (diurnal + maritime target adjustment) =====
     local temp_base: number = targets.temp_base or 20
     local temp_diurnal: number = targets.temp_diurnal or 5
     local temp_phase: number = targets.temp_phase or 14
     local computed_temp: number = compute_diurnal_temperature(temp_base, temp_diurnal, temp_phase)
-
+    -- Maritime cooling: subtract maritime * modifier (positive maritime = from sea = cooler)
+    computed_temp = computed_temp - maritime * sea_temp_modifier
     -- Apply flood modifier to temperature if applicable
     computed_temp = apply_flood_modifier("temp", computed_temp, targets, flood_state, nile_adjacent)
 
-    -- ===== Humidity (relaxed toward target) =====
+    -- ===== Humidity (relaxed toward maritime-adjusted target) =====
     local current_humidity: number = micro_humidity.current or targets.humidity or 50
     local target_humidity: number = targets.humidity or 50
+    -- Maritime humidity: add maritime * modifier to the target (positive maritime = from sea = more humid)
+    target_humidity = target_humidity + maritime * sea_humidity_modifier
     target_humidity = apply_flood_modifier("humidity", target_humidity, targets, flood_state, nile_adjacent)
+    -- Clamp target to valid range
+    if target_humidity < 0 then target_humidity = 0 end
+    if target_humidity > 100 then target_humidity = 100 end
     local computed_humidity: number = relax_value(current_humidity, target_humidity, RELAXATION_RATE, NOISE_SCALE_DEFAULT)
+    -- Clamp computed to valid range
+    if computed_humidity < 0 then computed_humidity = 0 end
+    if computed_humidity > 100 then computed_humidity = 100 end
 
     -- ===== Pressure (relaxed toward target + background driver offset) =====
     -- The driver offset is NOT stored in micro:pressure — only the base
@@ -322,43 +419,7 @@ local function evolve_grid_micro(grid_uuid: string): ()
     -- Mix in the background pressure driver from Proc3 (not persisted)
     local computed_pressure: number = evolved_pressure + pressure_driver_offset
 
-    -- ===== Wind speed (relaxed toward target with variability noise) =====
-    local current_wind_speed: number = micro_wind_speed.current or targets.wind_speed or 10
-    local target_wind_speed: number = targets.wind_speed or 10
-    local computed_wind_speed: number = relax_value(current_wind_speed, target_wind_speed, RELAXATION_RATE, wind_variability)
-
-    -- ===== Wind direction (angular interpolation toward target) =====
-    local current_wind_dir: number = micro_wind_dir.current or 0
-    local target_wind_dir: number = cardinal_to_degrees(targets.wind_dir or "N")
-    local computed_wind_dir: number = relax_wind_direction(current_wind_dir, target_wind_dir, RELAXATION_RATE, wind_variability)
-
-    -- ===== Maritime influence (wind direction → temperature/humidity bias) =====
-    -- Wind from the sea cools and humidifies; wind from inland heats and dries.
-    -- The humidity boost is capped by the state's sea_humidity_cap target
-    -- (if defined) so maritime influence can't push humidity beyond what
-    -- the state's climate profile allows.
-    local sea_direction: any = meta.sea_direction
-    local maritime: number = compute_maritime_influence(computed_wind_dir, sea_direction)
-    if maritime ~= 0 then
-        computed_temp = computed_temp - maritime * SEA_TEMP_MODIFIER
-
-        local humidity_boost: number = maritime * SEA_HUMIDITY_MODIFIER
-        local sea_humidity_cap: number = targets.sea_humidity_cap
-        if sea_humidity_cap then
-            -- Cap the total humidity, not just the boost
-            local capped_humidity: number = computed_humidity + humidity_boost
-            if capped_humidity > sea_humidity_cap then
-                capped_humidity = sea_humidity_cap
-            end
-            computed_humidity = capped_humidity
-        else
-            computed_humidity = computed_humidity + humidity_boost
-        end
-
-        -- Clamp humidity to valid range
-        if computed_humidity < 0 then computed_humidity = 0 end
-        if computed_humidity > 100 then computed_humidity = 100 end
-    end
+    -- (Wind speed and direction come from Proc3 driver, read above)
 
     -- ===== Precipitation (relaxed toward target) =====
     local current_precipitation: number = micro_precipitation.current or targets.precipitation or 0
@@ -391,6 +452,16 @@ local function evolve_grid_micro(grid_uuid: string): ()
     lsd_write_json(grid_uuid .. ":micro:visibility", {current = computed_visibility})
     lsd_write_json(grid_uuid .. ":micro:eep", {preset = eep_preset})
     lsd_write_json(grid_uuid .. ":micro:particle", {preset = particle_preset})
+
+    -- Write conditions summary for Proc3 (pressure-wind coupling)
+    -- Proc3 reads this to compute temperature/humidity influence on pressure
+    lsd_write_json(LSD_KEY_DRIVERS_CONDITIONS, {
+        temp = computed_temp,
+        humidity = computed_humidity,
+        pressure = computed_pressure,
+        wind_speed = computed_wind_speed,
+        wind_dir = computed_wind_dir,
+    })
 end
 
 -- Process one grid in the round-robin cycle.

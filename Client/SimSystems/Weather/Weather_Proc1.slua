@@ -4,7 +4,7 @@
 -- Handles macro-level compute: evolves macro state (relaxation metadata, pressure
 -- trends) and assembles STATE_RESP messages when grids poll for results.
 --
--- Proc1 round-robins through the grids registry on a 15-second cadence, evolving
+-- Proc1 round-robins through the grids registry on a 7.5-second cadence, evolving
 -- one grid per cycle. It also responds to STATE_POLL link messages from Main
 -- by reading the namespace and sending STATE_RESP back via link message.
 --
@@ -17,7 +17,7 @@
 local SCRIPT_ID = "PROC1"
 
 -- Compute cadence: how often Proc1 processes one grid in the round-robin (seconds)
-local COMPUTE_INTERVAL_SECONDS = 15
+local COMPUTE_INTERVAL_SECONDS = 7.5
 
 -- Link message constants (must match Main)
 local LINK_MSG_MARKER = 7777
@@ -53,7 +53,7 @@ local LSD_KEY_GRIDS = "grids"
 local LSD_KEY_DRIVERS_PRESSURE = "drivers:pressure"
 
 -- Relaxation model parameters (from SIMULATION_MATHS.md section 2)
-local RELAXATION_RATE = 0.1       -- How fast values drift toward targets (0-1)
+local RELAXATION_RATE = 0.05      -- How fast values drift toward targets (0-1)
 local NOISE_SCALE = 0.05          -- Stochastic perturbation scale
 
 --================================================//

@@ -17,7 +17,7 @@
 local SCRIPT_ID = "PROC3"
 
 -- Compute cadence: how often Proc3 updates drivers (seconds)
-local COMPUTE_INTERVAL_SECONDS = 5
+local COMPUTE_INTERVAL_SECONDS = 2.5
 
 -- Link message marker (must match Main's constant)
 local LINK_MSG_MARKER = 7777
@@ -52,6 +52,8 @@ local RECIPIENT = {
 local LSD_KEY_DRIVERS_FLOOD_STATE = "drivers:flood_state"
 local LSD_KEY_DRIVERS_PRESSURE = "drivers:pressure"
 local LSD_KEY_DRIVERS_EXTREME_WEATHER = "drivers:extreme_weather"
+local LSD_KEY_DRIVERS_WIND = "drivers:wind"
+local LSD_KEY_DRIVERS_CONDITIONS = "drivers:conditions"
 
 -- Flood state values
 local FLOOD_STATE_LOW = "low"
@@ -71,15 +73,35 @@ local FLOOD_PEAK_END_DAY = 304       -- Oct 31
 -- Pressure driver parameters (from SIMULATION_MATHS.md section 5)
 local PRESSURE_AMPLITUDE_HPA = 5         -- Base sinusoidal amplitude (±5 hPa)
 local PRESSURE_NOISE_RANGE_HPA = 2       -- Stochastic noise range (±1 hPa each side)
-local PRESSURE_PERIOD_CYCLES = 240       -- Cycles per full sinusoidal wave (240 * 5s = 20 min)
-local PRESSURE_HISTORY_MAX_ENTRIES = 5   -- Rolling window for trend computation
+local PRESSURE_PERIOD_CYCLES = 480       -- Cycles per full sinusoidal wave (480 * 2.5s = 20 min)
+local PRESSURE_HISTORY_MAX_ENTRIES = 10  -- Rolling window for trend computation (10 * 2.5s = 25s window)
 local PRESSURE_SEED_DIVISOR = 1200       -- Divides os.time() for cold-boot phase seed (1200s = 20min = one full cycle)
 
 -- Cyclone dip parameters
 local CYCLONE_DIP_CHANCE_PER_CYCLE = 0.05  -- 5% chance per cycle to start a dip
 local CYCLONE_DIP_MIN_MAGNITUDE_HPA = -8   -- Minimum dip magnitude
 local CYCLONE_DIP_MAX_MAGNITUDE_HPA = -15  -- Maximum dip magnitude
-local CYCLONE_DIP_DURATION_CYCLES = 20     -- How many cycles a dip lasts
+local CYCLONE_DIP_DURATION_CYCLES = 40     -- How many cycles a dip lasts (40 * 2.5s = 100s)
+
+-- Wind driver parameters (from WIND_DRIVER_DESIGN.md)
+local WIND_OSCILLATION_PERIOD_CYCLES = 480  -- Cycles per full calm/gust wave (480 * 2.5s = 20 min)
+local WIND_OSCILLATION_SEED_DIVISOR = 1200  -- Divides os.time() for cold-boot phase seed (1200s = 20 min)
+local WIND_CALM_FLOOR_KPH = 0.5             -- Minimum wind speed (avoid zero for display/math)
+local WIND_NOISE_SCALE = 0.05               -- Noise as fraction of base speed per cycle (reduced for stability)
+local WIND_SPEED_RELAX_RATE = 0.03          -- How fast speed relaxes toward target (low for smooth changes)
+local WIND_DIR_NOISE_DEGREES = 30           -- Max angular noise per cycle (at variability=1.0, reduced from 60)
+local WIND_DIR_RELAX_RATE = 0.03            -- How fast direction relaxes toward target (reduced for smoothness)
+local WIND_DIURNAL_SPEED_AMPLITUDE = 0.2    -- Diurnal speed variation (fraction of base, ±20%)
+local WIND_DIURNAL_DIR_SHIFT = 30           -- Direction shift (degrees) at peak sea breeze vs land breeze
+local TWO_PI = 2 * math.pi
+
+-- Pressure-wind coupling parameters (from WIND_DRIVER_DESIGN.md)
+local TEMP_PRESSURE_FACTOR = 0.3       -- hPa per °C deviation from seasonal avg
+local HUMIDITY_PRESSURE_FACTOR = 0.05  -- hPa per % deviation from seasonal avg
+local GRADIENT_WIND_FACTOR = 50        -- kph per hPa/min of pressure trend
+-- Seasonal averages (updated from conditions data, used as baseline for coupling)
+local seasonal_temp_avg: number = 25   -- Updated from grid targets
+local seasonal_humidity_avg: number = 70
 
 -- Months (for day-of-year computation)
 local DAYS_IN_MONTH_NON_LEAP: {number} = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31}
@@ -98,6 +120,26 @@ local pressure_offset_history: {number} = {}  -- Rolling window of recent offset
 local cyclone_dip_active: boolean = false   -- Whether a cyclone dip is currently in progress
 local cyclone_dip_magnitude: number = 0     -- Current dip magnitude (negative hPa)
 local cyclone_dip_timer: number = 0         -- Cycles remaining in the current dip
+
+-- Wind driver internal state (persisted in drivers:wind between cycles)
+local wind_phase: number = 0                -- Current phase of the calm/gust oscillation (radians)
+local wind_current_speed: number = 0        -- Current computed wind speed (kph)
+local wind_current_dir: number = 0          -- Current computed wind direction (degrees)
+-- State modifiers (interpolated when grid pushes new targets)
+local wind_speed_mod: number = 0            -- Current effective speed modifier (kph)
+local wind_dir_mod: number = 0              -- Current effective direction modifier (degrees)
+local wind_variability_mod: number = 0      -- Current effective variability modifier
+local wind_target_speed_mod: number = 0     -- Target speed modifier (from grid)
+local wind_target_dir_mod: number = 0       -- Target direction modifier (from grid)
+local wind_target_var_mod: number = 0       -- Target variability modifier (from grid)
+local wind_ramp_remaining: number = 0       -- Cycles remaining in modifier ramp (0 = settled)
+local wind_ramp_total: number = 0           -- Total ramp cycles (for progress calculation)
+local wind_base_speed: number = 15          -- Seasonal base wind speed (from conditions/config)
+local wind_base_dir: number = 337.5         -- Seasonal base wind direction (degrees, from config)
+local wind_variability: number = 0.3        -- Seasonal base variability (from config)
+local wind_gust_factor: number = 0.5        -- Gust multiplier (from config)
+local wind_calm_factor: number = 0.3        -- Calm multiplier (from config)
+local wind_sea_direction: number = 0        -- Sea direction in degrees (for diurnal breeze, from config)
 
 --================================================//
 
@@ -132,6 +174,36 @@ local function lsd_read_json(key_name: string): any
         return nil
     end
     return decoded
+end
+
+-- Get the list of registered grid UUIDs from LSD.
+-- Main stores this as a CSV string, not JSON, so we parse it manually.
+local function get_registered_grids(): {string}
+    local raw: string = lsd_read("grids")
+    if raw == "" then
+        return {}
+    end
+    local grids: {string} = {}
+    for uuid in string.gmatch(raw, "[^,]+") do
+        table.insert(grids, uuid)
+    end
+    return grids
+end
+
+-- Cardinal direction to degrees mapping (must match Proc2)
+local CARDINAL_TO_DEGREES: { [string]: number } = {
+    N = 0, NNE = 22.5, NE = 45, ENE = 67.5,
+    E = 90, ESE = 112.5, SE = 135, SSE = 157.5,
+    S = 180, SSW = 202.5, SW = 225, WSW = 247.5,
+    W = 270, WNW = 292.5, NW = 315, NNW = 337.5,
+}
+
+-- Convert a cardinal direction string to degrees.
+local function cardinal_to_degrees(cardinal: any): number
+    if type(cardinal) == "string" then
+        return CARDINAL_TO_DEGREES[cardinal] or 0
+    end
+    return tonumber(cardinal) or 0
 end
 
 --================================================//
@@ -198,6 +270,16 @@ end
 
 --================================================//
 
+--======== Shared Utilities =================--
+
+-- Read conditions (temp, humidity) written by Proc2 for pressure-wind coupling.
+-- Returns {temp, humidity} or nil if not yet available.
+local function read_conditions(): any
+    return lsd_read_json(LSD_KEY_DRIVERS_CONDITIONS)
+end
+
+--================================================//
+
 --======== Background Pressure Driver =========--
 
 -- Compute the linear regression slope over a history of offset values.
@@ -231,6 +313,8 @@ end
 
 -- Compute one cycle of the background pressure driver.
 -- Returns the offset (hPa), trend (hPa/cycle), and phase for this cycle.
+-- Incorporates temperature and humidity influences (thermal/moisture coupling)
+-- from the conditions data written by Proc2.
 local function compute_pressure_driver_cycle(): {offset: number, trend: number, phase: number}
     -- Advance the sinusoidal phase
     local phase_increment: number = (2 * math.pi) / PRESSURE_PERIOD_CYCLES
@@ -261,7 +345,20 @@ local function compute_pressure_driver_cycle(): {offset: number, trend: number, 
         end
     end
 
-    local total_offset: number = base_offset + noise + dip_offset
+    -- Thermal and moisture pressure coupling (from conditions data)
+    -- Warm air rises → lower pressure; cool air sinks → higher pressure
+    -- Moist air is less dense → lower pressure; dry air is denser → higher pressure
+    local thermal_offset: number = 0
+    local moisture_offset: number = 0
+    local conditions: any = read_conditions()
+    if conditions then
+        local temp: number = conditions.temp or seasonal_temp_avg
+        local humidity: number = conditions.humidity or seasonal_humidity_avg
+        thermal_offset = -(temp - seasonal_temp_avg) * TEMP_PRESSURE_FACTOR
+        moisture_offset = -(humidity - seasonal_humidity_avg) * HUMIDITY_PRESSURE_FACTOR
+    end
+
+    local total_offset: number = base_offset + noise + dip_offset + thermal_offset + moisture_offset
 
     -- Update rolling history for trend computation
     table.insert(pressure_offset_history, total_offset)
@@ -299,6 +396,303 @@ end
 
 --================================================//
 
+--============ Wind Driver ====================--
+
+-- Read wind configuration from the grid's meta (annual base values) and
+-- the current targets (seasonal overrides included by the grid). Falls back to defaults.
+local function read_wind_config(): ()
+    -- Try to read from any registered grid's meta
+    local grids: {string} = get_registered_grids()
+    if grids and #grids > 0 then
+        for _, grid_uuid in ipairs(grids) do
+            local meta: any = lsd_read_json(grid_uuid .. ":meta")
+            if meta then
+                -- Start with annual base from grid config
+                if meta.wind_base_speed then
+                    wind_base_speed = meta.wind_base_speed
+                end
+                if meta.wind_base_dir then
+                    wind_base_dir = cardinal_to_degrees(meta.wind_base_dir)
+                end
+                if meta.wind_variability then
+                    wind_variability = meta.wind_variability
+                end
+                if meta.wind_gust_factor then
+                    wind_gust_factor = meta.wind_gust_factor
+                end
+                if meta.wind_calm_factor then
+                    wind_calm_factor = meta.wind_calm_factor
+                end
+                if meta.sea_direction then
+                    wind_sea_direction = cardinal_to_degrees(meta.sea_direction)
+                end
+
+                -- Read seasonal wind base and averages from the grid's current targets
+                -- (the grid includes seasonal overrides in the targets it pushes, since
+                -- Proc3 is in a different linkset and can't read the grid's season: keys)
+                local targets: any = lsd_read_json(grid_uuid .. ":targets")
+                if targets then
+                    -- Seasonal wind overrides (take precedence over annual base)
+                    if targets.wind_base_speed then
+                        wind_base_speed = targets.wind_base_speed
+                    end
+                    if targets.wind_base_dir then
+                        wind_base_dir = cardinal_to_degrees(targets.wind_base_dir)
+                    end
+                    if targets.wind_variability_base then
+                        wind_variability = targets.wind_variability_base
+                    end
+                    -- Seasonal averages for pressure-wind coupling
+                    if targets.temp_base then
+                        seasonal_temp_avg = targets.temp_base
+                    end
+                    if targets.humidity then
+                        seasonal_humidity_avg = targets.humidity
+                    end
+                end
+                -- Use the first grid that has wind config
+                break
+            end
+        end
+    end
+    -- Log the current config (helps verify seasonal overrides loaded)
+    ll.OwnerSay("[" .. SCRIPT_ID .. "] Wind config: base_speed=" .. tostring(wind_base_speed)
+        .. ", base_dir=" .. tostring(wind_base_dir)
+        .. ", variability=" .. tostring(wind_variability)
+        .. ", sea_dir=" .. tostring(wind_sea_direction))
+end
+
+-- Check the grid's current targets for wind modifier changes.
+-- If the wind modifiers in the targets differ from what we're currently
+-- interpolating toward, start a new ramp to the new values.
+-- Also reads the ramp duration (in seconds) from the targets if present.
+local WIND_RAMP_DEFAULT_SECONDS = 300  -- Default ramp: 5 minutes
+local WIND_RAMP_MIN_CYCLES = 4         -- Minimum ramp length (avoid instant transitions)
+
+local function check_wind_modifier_changes(): ()
+    local grids: {string} = get_registered_grids()
+    if not grids or #grids == 0 then return end
+
+    for _, grid_uuid in ipairs(grids) do
+        local targets: any = lsd_read_json(grid_uuid .. ":targets")
+        if targets then
+            local new_speed_mod: number = targets.wind_speed_mod or 0
+            local new_dir_mod: number = targets.wind_dir_mod or 0
+            local new_var_mod: number = targets.wind_variability_mod or 0
+
+            -- Check if the target modifiers have changed
+            if new_speed_mod ~= wind_target_speed_mod
+               or new_dir_mod ~= wind_target_dir_mod
+               or new_var_mod ~= wind_target_var_mod then
+                -- Start a new ramp
+                wind_target_speed_mod = new_speed_mod
+                wind_target_dir_mod = new_dir_mod
+                wind_target_var_mod = new_var_mod
+
+                -- Ramp duration from targets (seconds), or default
+                local ramp_seconds: number = targets.wind_ramp_seconds or WIND_RAMP_DEFAULT_SECONDS
+                local ramp_cycles: number = math.floor(ramp_seconds / COMPUTE_INTERVAL_SECONDS)
+                if ramp_cycles < WIND_RAMP_MIN_CYCLES then
+                    ramp_cycles = WIND_RAMP_MIN_CYCLES
+                end
+                wind_ramp_remaining = ramp_cycles
+                wind_ramp_total = ramp_cycles
+
+                ll.OwnerSay("[" .. SCRIPT_ID .. "] Wind modifier change detected: "
+                    .. "speed_mod=" .. tostring(new_speed_mod)
+                    .. ", dir_mod=" .. tostring(new_dir_mod)
+                    .. ", var_mod=" .. tostring(new_var_mod)
+                    .. ", ramp=" .. tostring(ramp_cycles) .. " cycles ("
+                    .. tostring(ramp_cycles * COMPUTE_INTERVAL_SECONDS) .. "s)")
+            end
+
+            -- Use the first grid
+            break
+        end
+    end
+end
+
+-- Advance the state modifier ramp toward target modifiers.
+-- When ramp_remaining reaches 0, current mods equal target mods.
+local function advance_wind_ramp(): ()
+    if wind_ramp_remaining <= 0 then
+        wind_speed_mod = wind_target_speed_mod
+        wind_dir_mod = wind_target_dir_mod
+        wind_variability_mod = wind_target_var_mod
+        return
+    end
+
+    local progress: number = 1.0 - (wind_ramp_remaining / wind_ramp_total)
+    -- Linear interpolation from current to target
+    -- (We lerp from the values at ramp start; but since we update each cycle,
+    --  we just move current toward target by the per-cycle fraction)
+    local per_cycle: number = 1.0 / wind_ramp_remaining
+
+    wind_speed_mod = wind_speed_mod + (wind_target_speed_mod - wind_speed_mod) * per_cycle
+    wind_dir_mod = wind_dir_mod + (wind_target_dir_mod - wind_dir_mod) * per_cycle
+    wind_variability_mod = wind_variability_mod + (wind_target_var_mod - wind_variability_mod) * per_cycle
+
+    wind_ramp_remaining = wind_ramp_remaining - 1
+end
+
+-- Compute the diurnal wind factor from the sun position.
+-- Returns a value from -1 (night, land breeze) to +1 (midday, peak sea breeze).
+-- Uses ll.GetSunDirection() just like the temperature model — immune to
+-- region restart desync and follows the sim's actual day-night cycle.
+local function compute_diurnal_wind_factor(): number
+    local sun: any = ll.GetSunDirection()
+    if not sun then return 0 end
+    -- sun.z is the vertical component: >0 = above horizon (day), <0 = below (night)
+    -- Clamp to -1..1 for safety
+    local elevation: number = sun.z or 0
+    if elevation > 1 then elevation = 1 end
+    if elevation < -1 then elevation = -1 end
+    return elevation
+end
+
+-- Compute one cycle of the wind driver.
+-- Produces wind speed and direction based on:
+--   - Calm/gust oscillation (slow sinusoid)
+--   - Diurnal sea/land breeze (from sun position)
+--   - Pressure gradient wind (from pressure trend)
+--   - State modifier interpolation
+--   - Direction wandering with noise
+local function compute_wind_driver_cycle(): {speed: number, direction: number, speed_target: number, dir_target: number, ramp_progress: number}
+    -- Advance the calm/gust oscillation phase
+    local phase_increment: number = (2 * math.pi) / WIND_OSCILLATION_PERIOD_CYCLES
+    wind_phase = wind_phase + phase_increment
+
+    -- Advance state modifier ramp
+    advance_wind_ramp()
+
+    -- Effective variability (seasonal base + state mod)
+    local effective_variability: number = wind_variability + wind_variability_mod
+    if effective_variability < 0 then effective_variability = 0 end
+    if effective_variability > 1 then effective_variability = 1 end
+
+    -- Diurnal wind factor: -1 (night) to +1 (midday)
+    -- Daytime: stronger wind (sea breeze), direction shifts toward sea
+    -- Nighttime: weaker wind (land breeze), direction shifts away from sea
+    local diurnal: number = compute_diurnal_wind_factor()
+
+    -- Pressure gradient wind: read the pressure trend from the driver LSD
+    -- (pressure driver is computed before wind driver in the cycle, so the
+    -- LSD value is fresh). Falling pressure → stronger wind (storm building).
+    local pressure_trend_hpa_per_cycle: number = 0
+    local pressure_data: any = lsd_read_json(LSD_KEY_DRIVERS_PRESSURE)
+    if pressure_data and pressure_data.trend then
+        pressure_trend_hpa_per_cycle = pressure_data.trend
+    end
+    -- Convert trend from hPa/cycle to hPa/min (cycle = COMPUTE_INTERVAL_SECONDS)
+    local pressure_trend_hpa_per_min: number = pressure_trend_hpa_per_cycle / COMPUTE_INTERVAL_SECONDS
+    -- Gradient wind: negative trend (falling pressure) → positive wind contribution
+    -- (we invert the sign because falling pressure = stronger wind)
+    local gradient_wind: number = -pressure_trend_hpa_per_min * GRADIENT_WIND_FACTOR
+
+    -- Base speed from oscillation: ranges between calm and gust extremes
+    -- sin(phase) ranges -1 to +1
+    -- At sin=+1: gust (base * (1 + gust_factor))
+    -- At sin=-1: calm (base * (1 - calm_factor))
+    local oscillation: number = math.sin(wind_phase)
+    local speed_multiplier: number = 1.0 + (oscillation > 0 and oscillation * wind_gust_factor or oscillation * wind_calm_factor)
+    -- Diurnal speed modulation: +amplitude during day, -amplitude at night
+    local diurnal_speed_mod: number = 1.0 + diurnal * WIND_DIURNAL_SPEED_AMPLITUDE
+    local base_speed: number = wind_base_speed * speed_multiplier * diurnal_speed_mod
+
+    -- Apply state speed modifier and pressure gradient wind
+    local speed_target: number = base_speed + wind_speed_mod + gradient_wind
+    if speed_target < WIND_CALM_FLOOR_KPH then speed_target = WIND_CALM_FLOOR_KPH end
+
+    -- Direction target: base + state modifier + diurnal sea breeze shift
+    -- During day, wind shifts toward the sea direction (onshore breeze)
+    -- During night, wind shifts away from the sea (offshore land breeze)
+    local dir_target: number = wind_base_dir + wind_dir_mod
+    if wind_sea_direction ~= 0 then
+        -- Compute the shortest angular path from base_dir to sea_direction
+        local sea_delta: number = wind_sea_direction - wind_base_dir
+        if sea_delta > 180 then sea_delta = sea_delta - 360
+        elseif sea_delta < -180 then sea_delta = sea_delta + 360 end
+        -- Shift direction toward sea during day, away at night
+        dir_target = dir_target + sea_delta * diurnal * (WIND_DIURNAL_DIR_SHIFT / 180)
+    end
+    -- Wrap to 0-360
+    while dir_target < 0 do dir_target = dir_target + 360 end
+    while dir_target >= 360 do dir_target = dir_target - 360 end
+
+    -- Relax current speed toward target with noise
+    local speed_delta: number = (speed_target - wind_current_speed) * WIND_SPEED_RELAX_RATE
+    local speed_noise: number = (math.random() - 0.5) * 2 * WIND_NOISE_SCALE * wind_base_speed * effective_variability
+    wind_current_speed = wind_current_speed + speed_delta + speed_noise
+    if wind_current_speed < WIND_CALM_FLOOR_KPH then wind_current_speed = WIND_CALM_FLOOR_KPH end
+
+    -- Relax current direction toward target with angular noise
+    local dir_delta: number = dir_target - wind_current_dir
+    if dir_delta > 180 then dir_delta = dir_delta - 360
+    elseif dir_delta < -180 then dir_delta = dir_delta + 360 end
+    wind_current_dir = wind_current_dir + dir_delta * WIND_DIR_RELAX_RATE
+    local dir_noise: number = (math.random() - 0.5) * 2 * effective_variability * WIND_DIR_NOISE_DEGREES
+    wind_current_dir = wind_current_dir + dir_noise
+    -- Wrap to 0-360
+    while wind_current_dir < 0 do wind_current_dir = wind_current_dir + 360 end
+    while wind_current_dir >= 360 do wind_current_dir = wind_current_dir - 360 end
+
+    local ramp_progress: number = 1.0
+    if wind_ramp_total > 0 then
+        ramp_progress = 1.0 - (wind_ramp_remaining / wind_ramp_total)
+        if ramp_progress > 1.0 then ramp_progress = 1.0 end
+        if ramp_progress < 0 then ramp_progress = 0 end
+    end
+
+    return {
+        speed = wind_current_speed,
+        direction = wind_current_dir,
+        speed_target = speed_target,
+        dir_target = dir_target,
+        ramp_progress = ramp_progress,
+    }
+end
+
+-- Compute and write the wind driver state to LSD.
+-- Persists the full internal state so a script reset can resume seamlessly.
+local function update_wind_driver(): ()
+    -- Check for wind modifier changes from grid targets (starts ramp if changed)
+    check_wind_modifier_changes()
+
+    local wind_state: any = compute_wind_driver_cycle()
+
+    local wind_data: any = {
+        speed = wind_state.speed,
+        direction = wind_state.direction,
+        speed_target = wind_state.speed_target,
+        dir_target = wind_state.dir_target,
+        ramp_progress = wind_state.ramp_progress,
+        -- Internal state for reset recovery
+        phase = wind_phase,
+        current_speed = wind_current_speed,
+        current_dir = wind_current_dir,
+        speed_mod = wind_speed_mod,
+        dir_mod = wind_dir_mod,
+        var_mod = wind_variability_mod,
+        target_speed_mod = wind_target_speed_mod,
+        target_dir_mod = wind_target_dir_mod,
+        target_var_mod = wind_target_var_mod,
+        ramp_remaining = wind_ramp_remaining,
+        ramp_total = wind_ramp_total,
+        base_speed = wind_base_speed,
+        base_dir = wind_base_dir,
+        variability = wind_variability,
+        gust_factor = wind_gust_factor,
+        calm_factor = wind_calm_factor,
+        sea_direction = wind_sea_direction,
+        seasonal_temp_avg = seasonal_temp_avg,
+        seasonal_humidity_avg = seasonal_humidity_avg,
+    }
+
+    lsd_write_json(LSD_KEY_DRIVERS_WIND, wind_data)
+end
+
+--================================================//
+
 --============ Boot Sequence ==================--
 
 -- Initialize Proc3 on script start.
@@ -325,33 +719,90 @@ local function boot_proc3(): ()
     else
         -- Cold boot: seed phase from unix time so the sinusoid doesn't
         -- always start at zero. One full cycle = PRESSURE_PERIOD_CYCLES * COMPUTE_INTERVAL_SECONDS
-        -- = 240 * 5 = 1200 seconds. Map current time into [0, 2π).
+        -- = 480 * 2.5 = 1200 seconds. Map current time into [0, 2π).
         local cycle_position: number = (os.time() % PRESSURE_SEED_DIVISOR) / PRESSURE_SEED_DIVISOR
         pressure_phase = cycle_position * 2 * math.pi
     end
 
+    -- Restore wind driver state from LSD if available (script reset recovery).
+    local saved_wind: any = lsd_read_json(LSD_KEY_DRIVERS_WIND)
+    if saved_wind and saved_wind.phase then
+        wind_phase = saved_wind.phase
+        wind_current_speed = saved_wind.current_speed or 0
+        wind_current_dir = saved_wind.current_dir or 0
+        wind_speed_mod = saved_wind.speed_mod or 0
+        wind_dir_mod = saved_wind.dir_mod or 0
+        wind_variability_mod = saved_wind.var_mod or 0
+        wind_target_speed_mod = saved_wind.target_speed_mod or 0
+        wind_target_dir_mod = saved_wind.target_dir_mod or 0
+        wind_target_var_mod = saved_wind.target_var_mod or 0
+        wind_ramp_remaining = saved_wind.ramp_remaining or 0
+        wind_ramp_total = saved_wind.ramp_total or 0
+        wind_base_speed = saved_wind.base_speed or 15
+        wind_base_dir = saved_wind.base_dir or 337.5
+        wind_variability = saved_wind.variability or 0.3
+        wind_gust_factor = saved_wind.gust_factor or 0.5
+        wind_calm_factor = saved_wind.calm_factor or 0.3
+        wind_sea_direction = saved_wind.sea_direction or 0
+        if saved_wind.seasonal_temp_avg then
+            seasonal_temp_avg = saved_wind.seasonal_temp_avg
+        end
+        if saved_wind.seasonal_humidity_avg then
+            seasonal_humidity_avg = saved_wind.seasonal_humidity_avg
+        end
+    else
+        -- Cold boot: seed wind phase from unix time (same divisor as pressure,
+        -- 1200s = one full oscillation cycle)
+        local wind_cycle_position: number = (os.time() % WIND_OSCILLATION_SEED_DIVISOR) / WIND_OSCILLATION_SEED_DIVISOR
+        wind_phase = wind_cycle_position * 2 * math.pi
+        -- Initialize speed/dir to base values
+        wind_current_speed = wind_base_speed
+        wind_current_dir = wind_base_dir
+    end
+
+    -- Try to read wind config from registered grids (may override defaults)
+    read_wind_config()
+
     -- Compute and write initial driver values immediately
     update_flood_state()
     update_pressure_driver()
+    update_wind_driver()
 
     -- Start the compute timer
     LLTimers:every(COMPUTE_INTERVAL_SECONDS, function()
         update_flood_state()
         update_pressure_driver()
+        update_wind_driver()
     end)
 
-    ll.OwnerSay("[" .. SCRIPT_ID .. "] Proc3 is ready. Computing drivers every "
-        .. tostring(COMPUTE_INTERVAL_SECONDS) .. "s. Phase: "
-        .. string.format("%.3f", pressure_phase) .. " rad")
+    ll.OwnerSay("[" .. SCRIPT_ID .. "] Proc3 is ready. Computing every "
+        .. tostring(COMPUTE_INTERVAL_SECONDS) .. "s. Pressure phase: "
+        .. string.format("%.3f", pressure_phase) .. " rad, Wind phase: "
+        .. string.format("%.3f", wind_phase) .. " rad"
+        .. "\n  Wind config: base_speed=" .. tostring(wind_base_speed)
+        .. ", base_dir=" .. tostring(wind_base_dir)
+        .. ", variability=" .. tostring(wind_variability)
+        .. ", gust=" .. tostring(wind_gust_factor)
+        .. ", calm=" .. tostring(wind_calm_factor)
+        .. ", sea_dir=" .. tostring(wind_sea_direction))
 end
 
 --================================================//
 
 --=============== Events =======================--
 
--- Linkset data event: stub for future use.
+-- Linkset data event: re-read wind config when grids or targets change.
 LLEvents:on("linkset_data", function(action: number, name: string, value: string)
-    -- Future: react to reset_mode changes or other external triggers.
+    -- When the grids registry is updated (grid registered/unregistered),
+    -- re-read wind config from the newly available grid meta.
+    if name == "grids" then
+        read_wind_config()
+    end
+    -- When any grid's targets change (state transition or initial registration),
+    -- re-read wind config to pick up seasonal wind base overrides.
+    if string.find(name, ":targets", 1, true) then
+        read_wind_config()
+    end
 end)
 
 --================================================//

@@ -23,7 +23,7 @@ local COMMS_CHANNEL = -77777  -- Must match Main's COMMS_CHANNEL
 local NOTECARD_NAME = "Alexandria_Oasis"  -- Name of the weather model notecard in the prim's inventory
 
 -- Polling cadence
-local POLL_INTERVAL_SECONDS = 30
+local POLL_INTERVAL_SECONDS = 15
 local POLL_JITTER_SECONDS = 5  -- ±5 seconds random jitter to stagger across grids
 
 -- Link message constants (not used for external comms, but kept for consistency)
@@ -84,7 +84,7 @@ local SEASON_PERET_END_DAY = 9
 -- Progression parameters (from SIMULATION_MATHS.md section 6)
 local PRESSURE_TREND_WINDOW_SECONDS = 300    -- 5-minute evaluation window
 local PRESSURE_HISTORY_RETENTION_SECONDS = 600  -- 10-minute retention
-local TRANSITION_COOLDOWN_CYCLES = 3         -- Cycles to wait after a transition
+local TRANSITION_COOLDOWN_CYCLES = 6         -- Cycles to wait after a transition (6 * 15s = 90s)
 local TRANSITION_HISTORY_MAX = 20            -- Max entries in transition history log
 
 -- Bootstrap evaluation thresholds (from SIMULATION_MATHS.md section 6)
@@ -97,7 +97,7 @@ local BOOTSTRAP_TREND_THRESHOLD = -0.2 -- hPa/min trend for event trigger
 local SEASON_BLEND_DAYS = 7  -- Last N days of season blend toward next
 
 -- Duration conversion
-local CYCLES_PER_HOUR = 120  -- At 30-second poll intervals, 1 hour = 120 cycles
+local CYCLES_PER_HOUR = 240  -- At 15-second poll intervals, 1 hour = 240 cycles
 
 --================================================//
 
@@ -125,6 +125,7 @@ local current_season: string = ""  -- "Akhet", "Peret", "Shemu"
 local current_state_name: string = ""  -- "Clear Skies", "Khamsin", etc.
 local current_state_params: any = {}  -- Accumulated key=value pairs for current state
 local current_grid_config: any = {}  -- Accumulated key=value pairs for grid section
+local current_season_config: any = {}  -- Accumulated key=value pairs for season-level fields
 
 --================================================//
 
@@ -338,8 +339,13 @@ local function process_notecard_line(raw_line: string): ()
             current_scope = "grid"
             current_season = ""
         elseif scope_type == "season" then
+            -- Flush any pending season config to LSD
+            if current_season ~= "" and next(current_season_config) then
+                lsd_write_json("season:" .. current_season, current_season_config)
+            end
             current_scope = "season"
             current_season = scope_name
+            current_season_config = {}
         end
         return
     end
@@ -359,8 +365,13 @@ local function process_notecard_line(raw_line: string): ()
     if key ~= "" then
         if current_scope == "grid" then
             current_grid_config[key] = value
-        elseif current_scope == "season" and current_state_name ~= "" then
-            current_state_params[key] = value
+        elseif current_scope == "season" then
+            if current_state_name ~= "" then
+                current_state_params[key] = value
+            else
+                -- Season-level field (not inside a state block)
+                current_season_config[key] = value
+            end
         end
         return
     end
@@ -436,6 +447,10 @@ local function handle_notecard_line_data(query_id: string, data: string): ()
         -- Notecard fully loaded — flush remaining state and config
         flush_current_state()
         flush_grid_config()
+        -- Flush any remaining season config
+        if current_season ~= "" and next(current_season_config) then
+            lsd_write_json("season:" .. current_season, current_season_config)
+        end
         notecard_loaded = true
         ll.OwnerSay("[" .. SCRIPT_ID .. "] Notecard loaded: " .. NOTECARD_NAME)
 
@@ -458,10 +473,15 @@ end
 
 -- Extract the flat target parameter set from a state definition.
 -- This is what gets sent to the processor via TARGET_PUSH.
-local function extract_targets_from_state(state_def: any): any
+-- Includes seasonal wind base values so Proc3 can configure its wind driver
+-- (Proc3 is in a different linkset and can't read the grid's season: config keys).
+local function extract_targets_from_state(state_def: any, season: string): any
     if not state_def then
         return {}
     end
+
+    -- Read seasonal wind config from the grid's LSD
+    local season_config: any = lsd_read_json("season:" .. season) or {}
 
     return {
         temp_base = state_def.temp_base,
@@ -469,6 +489,15 @@ local function extract_targets_from_state(state_def: any): any
         temp_phase = state_def.temp_phase,
         humidity = state_def.humidity,
         pressure = state_def.pressure,
+        -- Wind modifiers (Proc3 reads these and interpolates wind speed/direction)
+        wind_speed_mod = state_def.wind_speed_mod or 0,
+        wind_dir_mod = state_def.wind_dir_mod or 0,
+        wind_variability_mod = state_def.wind_variability_mod or 0,
+        -- Seasonal wind base (so Proc3 can configure its driver without access to grid LSD)
+        wind_base_speed = season_config.wind_base_speed,
+        wind_base_dir = season_config.wind_base_dir,
+        wind_variability_base = season_config.wind_variability,
+        -- Keep absolute wind fields for backward compat (Proc2 fallback)
         wind_speed = state_def.wind_speed,
         wind_dir = state_def.wind_dir,
         wind_variability = state_def.wind_variability,
@@ -482,8 +511,6 @@ local function extract_targets_from_state(state_def: any): any
         flood_receding_humidity = state_def.flood_receding_humidity,
         flood_low_dust = state_def.flood_low_dust,
         flood_rising_humidity = state_def.flood_rising_humidity,
-        -- Maritime influence cap
-        sea_humidity_cap = state_def.sea_humidity_cap,
     }
 end
 
@@ -568,6 +595,73 @@ local PROGRESS_DEFAULT_LOGIC = "or"   -- Deterioration: either trend OR humidity
 local REGRESS_DEFAULT_LOGIC = "and"   -- Clearing: both trend AND humidity should confirm
 local DIVERGE_DEFAULT_LOGIC = "and"   -- Events: all conditions must align
 
+-- Replace spaces with underscores for per-target condition key slugs.
+local function slugify(name: string): string
+    return string.gsub(name, "%s+", "_")
+end
+
+-- Look up a condition value for a path, first trying the per-target key
+-- (e.g. "progress_Hazy_Heat_humidity_min"), then the base key
+-- (e.g. "progress_humidity_min"). Returns the value or nil if neither exists.
+local function get_condition_value(state_def: any, path_type: string, target_name: string, field: string): any
+    local slug: string = slugify(target_name)
+    local per_target_key: string = path_type .. "_" .. slug .. "_" .. field
+    if state_def[per_target_key] ~= nil then
+        return state_def[per_target_key]
+    end
+    local base_key: string = path_type .. "_" .. field
+    return state_def[base_key]
+end
+
+-- Sun phase detection. Uses ll.GetSunDirection() so it respects custom sun
+-- cycles, accelerated days, eternal noon, etc. Wallclock cannot be trusted.
+local function get_sun_phase(): string
+    local sun: any = ll.GetSunDirection()
+    if not sun then return "unknown" end
+    local z: number = sun.z or 0
+    local x: number = sun.x or 0
+
+    if z <= 0 then
+        return "night"
+    end
+
+    -- Low sun (< 0.5 elevation): morning or evening
+    -- High sun (>= 0.5 elevation): mid-day
+    if z < 0.5 then
+        if x > 0 then
+            return "morning"   -- sun rising in the east (+X in SL)
+        else
+            return "evening"   -- sun setting in the west (-X in SL)
+        end
+    end
+
+    return "day"
+end
+
+-- Check whether a time-of-day condition is met for a path.
+-- Reads *_morning, *_day, *_evening, *_night boolean flags from the state def,
+-- first looking for a per-target key (e.g. "diverge_Coastal_Mist_morning"),
+-- then the base key (e.g. "diverge_morning").
+-- If none are set, the path has no time-of-day restriction.
+-- If any are set, the current sun phase must match one of the allowed phases.
+local function sun_phase_allowed(path_type: string, current_state_def: any, target_name: string): boolean
+    local morning: boolean = get_condition_value(current_state_def, path_type, target_name, "morning") == true
+    local day: boolean = get_condition_value(current_state_def, path_type, target_name, "day") == true
+    local evening: boolean = get_condition_value(current_state_def, path_type, target_name, "evening") == true
+    local night: boolean = get_condition_value(current_state_def, path_type, target_name, "night") == true
+
+    if not morning and not day and not evening and not night then
+        return true  -- no sun-phase restriction
+    end
+
+    local phase: string = get_sun_phase()
+    if phase == "morning" and morning then return true end
+    if phase == "day" and day then return true end
+    if phase == "evening" and evening then return true end
+    if phase == "night" and night then return true end
+    return false
+end
+
 -- Check if a progression path's condition is met.
 -- Conditions are read from the current state's definition in the notecard,
 -- not hardcoded by state name. This makes the progression logic fully
@@ -576,9 +670,17 @@ local DIVERGE_DEFAULT_LOGIC = "and"   -- Events: all conditions must align
 -- Condition fields (on the current state, prefixed by path type):
 --   progress_trend_max   — trigger if trend < this (negative = dropping)
 --   progress_humidity_min — trigger if humidity > this
+--   progress_morning     — if true, path is only active in the morning
+--   progress_day         — if true, path is only active during mid-day
+--   progress_evening     — if true, path is only active in the evening
+--   progress_night       — if true, path is only active at night
 --   progress_logic       — "and" or "or" (default "or")
 --   regress_trend_min    — trigger if trend > this (positive = rising)
 --   regress_humidity_max — trigger if humidity < this
+--   regress_morning      — if true, path is only active in the morning
+--   regress_day          — if true, path is only active during mid-day
+--   regress_evening      — if true, path is only active in the evening
+--   regress_night        — if true, path is only active at night
 --   regress_logic        — "and" or "or" (default "and")
 --   diverge_pressure_max — trigger if pressure < this (absolute, for events)
 --   diverge_trend_max    — trigger if trend < this (rapid drop)
@@ -587,19 +689,28 @@ local DIVERGE_DEFAULT_LOGIC = "and"   -- Events: all conditions must align
 -- path_type: "progress", "regress", or "diverge"
 -- current_state_def: the definition of the state we're transitioning FROM
 --   (this is where the condition fields live, alongside the progresses_to/regresses_to/diverges_to edges)
+-- target_name: name of the state we're transitioning TO (used for per-target conditions)
 -- local_trend: time-windowed pressure trend in hPa/min
 -- current_values: the latest computed values from STATE_RESP
-local function check_progression_condition(path_type: string, current_state_def: any, local_trend: number, current_values: any): boolean
+local function check_progression_condition(path_type: string, current_state_def: any, target_name: string, local_trend: number, current_values: any): boolean
     local pressure: number = current_values.pressure or 1013
     local humidity: number = current_values.humidity or 50
+    local temp: number = current_values.temp or 25
+    local wind_speed: number = current_values.wind_speed or 0
 
     if path_type == "progress" then
-        local trend_threshold: number = current_state_def.progress_trend_max
-        local humidity_threshold: number = current_state_def.progress_humidity_min
-        local logic: string = current_state_def.progress_logic or PROGRESS_DEFAULT_LOGIC
+        local trend_threshold: number = get_condition_value(current_state_def, "progress", target_name, "trend_max")
+        local humidity_threshold: number = get_condition_value(current_state_def, "progress", target_name, "humidity_min")
+        local logic: string = get_condition_value(current_state_def, "progress", target_name, "logic") or PROGRESS_DEFAULT_LOGIC
 
         -- If no condition fields are defined, the path never triggers
         if not trend_threshold and not humidity_threshold then
+            return false
+        end
+
+        -- Sun-phase gate: if progress_morning/day/evening/night flags are set,
+        -- the path is only active during the allowed phases.
+        if not sun_phase_allowed("progress", current_state_def, target_name) then
             return false
         end
 
@@ -620,11 +731,16 @@ local function check_progression_condition(path_type: string, current_state_def:
         end
 
     elseif path_type == "regress" then
-        local trend_threshold: number = current_state_def.regress_trend_min
-        local humidity_threshold: number = current_state_def.regress_humidity_max
-        local logic: string = current_state_def.regress_logic or REGRESS_DEFAULT_LOGIC
+        local trend_threshold: number = get_condition_value(current_state_def, "regress", target_name, "trend_min")
+        local humidity_threshold: number = get_condition_value(current_state_def, "regress", target_name, "humidity_max")
+        local logic: string = get_condition_value(current_state_def, "regress", target_name, "logic") or REGRESS_DEFAULT_LOGIC
 
         if not trend_threshold and not humidity_threshold then
+            return false
+        end
+
+        -- Sun-phase gate for regression paths.
+        if not sun_phase_allowed("regress", current_state_def, target_name) then
             return false
         end
 
@@ -644,23 +760,48 @@ local function check_progression_condition(path_type: string, current_state_def:
         end
 
     elseif path_type == "diverge" then
-        local pressure_threshold: number = current_state_def.diverge_pressure_max
-        local trend_threshold: number = current_state_def.diverge_trend_max
-        local logic: string = current_state_def.diverge_logic or DIVERGE_DEFAULT_LOGIC
+        local pressure_threshold: number = get_condition_value(current_state_def, "diverge", target_name, "pressure_max")
+        local trend_threshold: number = get_condition_value(current_state_def, "diverge", target_name, "trend_max")
+        local humidity_min_threshold: number = get_condition_value(current_state_def, "diverge", target_name, "humidity_min")
+        local humidity_max_threshold: number = get_condition_value(current_state_def, "diverge", target_name, "humidity_max")
+        local temp_min_threshold: number = get_condition_value(current_state_def, "diverge", target_name, "temp_min")
+        local wind_min_threshold: number = get_condition_value(current_state_def, "diverge", target_name, "wind_speed_min")
+        local wind_max_threshold: number = get_condition_value(current_state_def, "diverge", target_name, "wind_speed_max")
+        local logic: string = get_condition_value(current_state_def, "diverge", target_name, "logic") or DIVERGE_DEFAULT_LOGIC
 
-        if not pressure_threshold and not trend_threshold then
+        local has_conditions: boolean = pressure_threshold or trend_threshold
+            or humidity_min_threshold or humidity_max_threshold
+            or temp_min_threshold or wind_min_threshold or wind_max_threshold
+
+        if not has_conditions then
+            return false
+        end
+
+        -- Sun-phase gate for divergence paths.
+        if not sun_phase_allowed("diverge", current_state_def, target_name) then
             return false
         end
 
         local pressure_met: boolean = pressure_threshold ~= nil and pressure < pressure_threshold
         local trend_met: boolean = trend_threshold ~= nil and local_trend < trend_threshold
+        local humidity_min_met: boolean = humidity_min_threshold ~= nil and humidity > humidity_min_threshold
+        local humidity_max_met: boolean = humidity_max_threshold ~= nil and humidity < humidity_max_threshold
+        local temp_met: boolean = temp_min_threshold ~= nil and temp > temp_min_threshold
+        local wind_min_met: boolean = wind_min_threshold ~= nil and wind_speed > wind_min_threshold
+        local wind_max_met: boolean = wind_max_threshold ~= nil and wind_speed < wind_max_threshold
 
         if logic == "or" then
-            return pressure_met or trend_met
+            return pressure_met or trend_met or humidity_min_met or humidity_max_met
+                or temp_met or wind_min_met or wind_max_met
         else
             local conditions: {boolean} = {}
             if pressure_threshold then table.insert(conditions, pressure_met) end
             if trend_threshold then table.insert(conditions, trend_met) end
+            if humidity_min_threshold then table.insert(conditions, humidity_min_met) end
+            if humidity_max_threshold then table.insert(conditions, humidity_max_met) end
+            if temp_min_threshold then table.insert(conditions, temp_met) end
+            if wind_min_threshold then table.insert(conditions, wind_min_met) end
+            if wind_max_threshold then table.insert(conditions, wind_max_met) end
             for _, met in ipairs(conditions) do
                 if not met then return false end
             end
@@ -728,12 +869,12 @@ local function pick_among_ready(ready_candidates: {{def: any, name: string}}, se
 end
 
 -- Evaluate progression for the current state.
--- Returns (new_state_def, reason_string) if a transition should occur, or (nil, nil) to stay.
-local function evaluate_progression(current_state_def: any, season: string, current_values: any, transition_state: any): (any, string)
+-- Returns (state_name, new_state_def, reason_string) if a transition should occur, or (nil, nil, nil) to stay.
+local function evaluate_progression(current_state_def: any, season: string, current_values: any, transition_state: any): (string, any, string)
     -- Don't transition if in cooldown
     if transition_state.cooldown and transition_state.cooldown > 0 then
         transition_state.cooldown = transition_state.cooldown - 1
-        return nil, ""
+        return nil, nil, ""
     end
 
     -- Don't evaluate progression conditions if minimum duration hasn't been reached.
@@ -742,7 +883,7 @@ local function evaluate_progression(current_state_def: any, season: string, curr
     local duration_timer: number = (transition_state.duration_timer or 0) + 1
     transition_state.duration_timer = duration_timer
     if duration_timer < duration_min then
-        return nil, ""
+        return nil, nil, ""
     end
 
     -- Check for forced lock — if locked, no transitions
@@ -753,7 +894,7 @@ local function evaluate_progression(current_state_def: any, season: string, curr
             transition_state.lock = nil
             -- Fall through to normal evaluation
         else
-            return nil, ""
+            return nil, nil, ""
         end
     end
 
@@ -795,7 +936,8 @@ local function evaluate_progression(current_state_def: any, season: string, curr
 
             -- Conditions are read from the current state's definition (where the
             -- progression edges are declared), not from the target state.
-            local condition_met: boolean = check_progression_condition(cand.type, current_state_def, effective_trend, current_values)
+            -- target_name lets us look up per-target condition overrides.
+            local condition_met: boolean = check_progression_condition(cand.type, current_state_def, cand.name, effective_trend, current_values)
             if condition_met then
                 -- Apply bias weight multiplier to the biased candidate
                 if active_bias_target and cand.name == active_bias_target then
@@ -810,7 +952,7 @@ local function evaluate_progression(current_state_def: any, season: string, curr
     if #ready == 1 then
         transition_state.cooldown = TRANSITION_COOLDOWN_CYCLES
         transition_state.duration_timer = 0
-        return ready[1].def, ready[1].path_type .. " condition met → " .. ready[1].name
+        return ready[1].name, ready[1].def, ready[1].path_type .. " condition met → " .. ready[1].name
     end
 
     -- If multiple candidates are ready, use weight as tiebreaker
@@ -819,7 +961,7 @@ local function evaluate_progression(current_state_def: any, season: string, curr
         local chosen_name: string = chosen._name or "Unknown"
         transition_state.cooldown = TRANSITION_COOLDOWN_CYCLES
         transition_state.duration_timer = 0
-        return chosen, "multiple conditions met, weighted pick → " .. chosen_name
+        return chosen_name, chosen, "multiple conditions met, weighted pick → " .. chosen_name
     end
 
     -- No candidates ready — check duration expiry
@@ -833,7 +975,7 @@ local function evaluate_progression(current_state_def: any, season: string, curr
                 if def then
                     transition_state.cooldown = TRANSITION_COOLDOWN_CYCLES
                     transition_state.duration_timer = 0
-                    return def, "duration expired, regress → " .. cand.name
+                    return cand.name, def, "duration expired, regress → " .. cand.name
                 end
             end
         end
@@ -843,13 +985,13 @@ local function evaluate_progression(current_state_def: any, season: string, curr
                 if def then
                     transition_state.cooldown = TRANSITION_COOLDOWN_CYCLES
                     transition_state.duration_timer = 0
-                    return def, "duration expired, progress → " .. cand.name
+                    return cand.name, def, "duration expired, progress → " .. cand.name
                 end
             end
         end
     end
 
-    return nil, ""
+    return nil, nil, ""
 end
 
 --================================================//
@@ -1006,54 +1148,129 @@ end
 
 --========= State Transition Handling =========--
 
--- Handle a state transition: update transition state, push new targets, log history.
-local function execute_state_transition(new_state_def: any, season: string, transition_state: any, reason: string): ()
-    local new_state_name: string = new_state_def._name or "Unknown"
+-- Handle a state transition: push new targets early (for ramp), then commit
+-- the visual transition (EEP/particles) after the ramp period.
+-- For bootstrap/force transitions, the ramp is skipped (immediate commit).
+local pending_transition: any = nil  -- {state_name, state_def, season, reason, commit_time}
+
+local function execute_state_transition(new_state_name: string, new_state_def: any, season: string, transition_state: any, reason: string, skip_ramp: boolean): ()
+    new_state_name = new_state_name or "Unknown"
     local old_state_name: string = transition_state.current or "Unknown"
 
-    -- Update transition state
-    transition_state.current = new_state_name
-    transition_state.season = season
+    -- Extract and push new targets to the processor immediately
+    -- This starts the wind ramp in Proc3 and target interpolation in Proc2
+    local targets: any = extract_targets_from_state(new_state_def, season)
+
+    -- Determine ramp duration
+    local ramp_seconds: number = 300  -- Default 5 minutes
+    if skip_ramp then
+        ramp_seconds = 0
+    end
+
+    -- Set ramp seconds in targets so Proc2 and Proc3 know the ramp duration
+    targets.wind_ramp_seconds = ramp_seconds
+
+    send_target_push(targets)
+
+    if ramp_seconds > 0 then
+        -- Two-phase: store pending transition, commit after ramp
+        pending_transition = {
+            state_name = new_state_name,
+            state_def = new_state_def,
+            season = season,
+            reason = reason,
+            old_state_name = old_state_name,
+            commit_time = os.time() + ramp_seconds,
+        }
+        ll.OwnerSay("[" .. SCRIPT_ID .. "] State transition ramping: " .. old_state_name .. " → " .. new_state_name
+            .. " (" .. reason .. ") — committing in " .. tostring(ramp_seconds) .. "s")
+    else
+        -- Immediate commit (bootstrap/force)
+        -- Update transition state
+        transition_state.current = new_state_name
+        transition_state.season = season
+        transition_state.cooldown = TRANSITION_COOLDOWN_CYCLES
+        transition_state.duration_timer = 0
+        transition_state.state_changed_at = os.time()
+
+        -- Parse and set duration target and minimum
+        local duration_str: string = new_state_def.duration or "1-6"
+        transition_state.duration_target = choose_duration_cycles(duration_str)
+        transition_state.duration_min = min_duration_cycles(duration_str)
+
+        -- Write transition state back to LSD
+        lsd_write_json(LSD_KEY_TRANSITION, transition_state)
+
+        -- Update the grid's runtime state with new EEP/particle info
+        local state: any = lsd_read_json(LSD_KEY_STATE) or {}
+        state.current_state = new_state_name
+        state.season = season
+        state.eep_preset = new_state_def.eep_preset or "none"
+        state.particle = new_state_def.particle or "none"
+        lsd_write_json(LSD_KEY_STATE, state)
+
+        -- Record in transition history
+        local history: any = lsd_read_json(LSD_KEY_TRANSITION_HISTORY) or {}
+        table.insert(history, {
+            ts = os.time(),
+            from = old_state_name,
+            to = new_state_name,
+            reason = reason,
+        })
+        -- Trim to last N entries
+        while #history > TRANSITION_HISTORY_MAX do
+            table.remove(history, 1)
+        end
+        lsd_write_json(LSD_KEY_TRANSITION_HISTORY, history)
+
+        ll.OwnerSay("[" .. SCRIPT_ID .. "] State transition: " .. old_state_name .. " → " .. new_state_name
+            .. " (" .. reason .. ")")
+    end
+end
+
+-- Check if a pending transition's ramp has completed and commit it.
+local function check_pending_transition(): ()
+    if not pending_transition then return end
+    if os.time() < pending_transition.commit_time then return end
+
+    -- Ramp complete — commit the transition
+    local pt: any = pending_transition
+    pending_transition = nil
+
+    local transition_state: any = lsd_read_json(LSD_KEY_TRANSITION) or {}
+    transition_state.current = pt.state_name
+    transition_state.season = pt.season
     transition_state.cooldown = TRANSITION_COOLDOWN_CYCLES
     transition_state.duration_timer = 0
     transition_state.state_changed_at = os.time()
 
-    -- Parse and set duration target and minimum
-    local duration_str: string = new_state_def.duration or "1-6"
+    local duration_str: string = pt.state_def.duration or "1-6"
     transition_state.duration_target = choose_duration_cycles(duration_str)
     transition_state.duration_min = min_duration_cycles(duration_str)
 
-    -- Write transition state back to LSD
     lsd_write_json(LSD_KEY_TRANSITION, transition_state)
 
-    -- Extract and push new targets to the processor
-    local targets: any = extract_targets_from_state(new_state_def)
-    send_target_push(targets)
-
-    -- Update the grid's runtime state with new EEP/particle info
     local state: any = lsd_read_json(LSD_KEY_STATE) or {}
-    state.current_state = new_state_name
-    state.season = season
-    state.eep_preset = new_state_def.eep_preset or "none"
-    state.particle = new_state_def.particle or "none"
+    state.current_state = pt.state_name
+    state.season = pt.season
+    state.eep_preset = pt.state_def.eep_preset or "none"
+    state.particle = pt.state_def.particle or "none"
     lsd_write_json(LSD_KEY_STATE, state)
 
-    -- Record in transition history
     local history: any = lsd_read_json(LSD_KEY_TRANSITION_HISTORY) or {}
     table.insert(history, {
         ts = os.time(),
-        from = old_state_name,
-        to = new_state_name,
-        reason = reason,
+        from = pt.old_state_name,
+        to = pt.state_name,
+        reason = pt.reason,
     })
-    -- Trim to last N entries
     while #history > TRANSITION_HISTORY_MAX do
         table.remove(history, 1)
     end
     lsd_write_json(LSD_KEY_TRANSITION_HISTORY, history)
 
-    ll.OwnerSay("[" .. SCRIPT_ID .. "] State transition: " .. old_state_name .. " → " .. new_state_name
-        .. " (" .. reason .. ")")
+    ll.OwnerSay("[" .. SCRIPT_ID .. "] State transition: " .. pt.old_state_name .. " → " .. pt.state_name
+        .. " (" .. pt.reason .. ")")
 end
 
 --================================================//
@@ -1111,6 +1328,12 @@ local function update_display(state: any): ()
 end
 
 local function handle_state_resp(values: any, evolution: any): ()
+    -- Ignore responses while the notecard is reloading; LSD state definitions are
+    -- momentarily missing and transition_state may reference a stale season/state.
+    if not notecard_loaded or not is_registered then
+        return
+    end
+
     local season: string = get_season_from_sl_date()
 
     -- Read current transition state from LSD
@@ -1151,10 +1374,8 @@ local function handle_state_resp(values: any, evolution: any): ()
         is_first_poll = false
         local bootstrap_state: any = bootstrap_evaluate(values, season)
         if bootstrap_state then
-            bootstrap_state._name = bootstrap_state._name or "Unknown"
-            -- Look up the actual state name from the season's states
-            -- For now, use the bootstrap result directly
-            execute_state_transition(bootstrap_state, season, transition_state, "bootstrap: pressure delta from baseline")
+            local bootstrap_name: string = bootstrap_state._name or "Unknown"
+            execute_state_transition(bootstrap_name, bootstrap_state, season, transition_state, "bootstrap: pressure delta from baseline", true)
             return
         end
         -- No bootstrap transition needed — stay in Clear Skies
@@ -1171,10 +1392,16 @@ local function handle_state_resp(values: any, evolution: any): ()
         return
     end
 
-    local new_state_def: any, reason: string = evaluate_progression(current_state_def, season, values, transition_state)
+    -- Don't evaluate transitions while a pending (ramping) transition is in progress
+    if pending_transition then
+        lsd_write_json(LSD_KEY_TRANSITION, transition_state)
+        return
+    end
+
+    local new_state_name: string, new_state_def: any, reason: string = evaluate_progression(current_state_def, season, values, transition_state)
 
     if new_state_def then
-        execute_state_transition(new_state_def, season, transition_state, reason)
+        execute_state_transition(new_state_name, new_state_def, season, transition_state, reason, false)
     else
         -- No transition — save the updated transition state (with new pressure reading)
         lsd_write_json(LSD_KEY_TRANSITION, transition_state)
@@ -1187,10 +1414,18 @@ end
 
 -- Start the polling timer with jitter.
 start_polling = function(): ()
+    -- Avoid stacking multiple polling timers across notecard reloads.
+    -- The existing timer continues running; handle_state_resp now guards
+    -- against processing responses while the notecard is loading.
+    if poll_timer_handler then
+        return
+    end
+
     local jitter: number = math.random(-POLL_JITTER_SECONDS, POLL_JITTER_SECONDS)
     local interval: number = POLL_INTERVAL_SECONDS + jitter
 
     poll_timer_handler = LLTimers:every(interval, function()
+        check_pending_transition()
         send_state_poll()
     end)
 end
@@ -1232,7 +1467,7 @@ register_with_main = function(): ()
     end
 
     -- Extract initial targets
-    local initial_targets: any = extract_targets_from_state(clear_skies)
+    local initial_targets: any = extract_targets_from_state(clear_skies, season)
 
     -- Initialize transition state
     local transition_state: any = {
