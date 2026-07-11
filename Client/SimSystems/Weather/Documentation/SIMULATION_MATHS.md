@@ -1,19 +1,19 @@
 # Weather Simulation Maths
 
-Reference for the computational models used by the processor scripts and the grid's transition logic. All formulas are designed for SLua's constraints: 64 KB working set, no external libraries, float64 arithmetic.
+Reference for the computational models used by the processor scripts and the grid's transition logic.
 
 ## 1. Diurnal temperature
 
-Temperature is computed continuously from the sun's position, not stored as a static value. Proc2 computes this each cycle using `ll.GetSunDirection()`.
+Proc2 computes temperature each cycle from `ll.GetSunDirection()`, not from a stored static value.
 
 ### Why sun direction, not wallclock?
 
-The system originally used `llGetWallclock()` (seconds since midnight in SL time), but this was replaced with `ll.GetSunDirection()` for two critical reasons:
+The system originally used `llGetWallclock()` but switched to `ll.GetSunDirection()` for two reasons:
 
-1. **Custom sun cycles**: Many regions run accelerated day/night cycles, eternal noon, or custom sun configurations. `llGetWallclock()` returns SL time which may not correspond to the actual sun position in these regions. The diurnal temperature curve would be out of sync with the visible sun.
-2. **Region restart desync**: `llGetTimeOfDay()` and wallclock can drift after region restarts. The sun direction vector is always authoritative.
+1. **Custom sun cycles**: Many regions run accelerated day/night cycles, eternal noon, or custom sun configurations. `llGetWallclock()` returns SL time that may not match the visible sun.
+2. **Region restart desync**: Wallclock can drift after region restarts. The sun direction vector is always authoritative.
 
-`ll.GetSunDirection()` returns a normalized 3D vector pointing toward the sun. SL's sun path: rises in the east (+X), sets in the west (-X), arcs through the sky (+Z at noon, -Z at midnight). We use `atan2(z, x)` to extract the orbital angle and map it to a 24-hour clock.
+`ll.GetSunDirection()` returns a normalized 3D vector. SL's sun rises in the east (+X), sets in the west (-X), arcs through the sky (+Z at noon, -Z at midnight). We extract the orbital angle with `atan2(z, x)` and map it to a 24-hour clock.
 
 ### Formula
 
@@ -45,12 +45,6 @@ Where:
 - `temp_base` — daily mean temperature (from current target parameters)
 - `temp_diurnal` — half the day/night swing amplitude (from current target parameters)
 - `temp_phase` — hour of peak temperature (typically 14, as peak heat lags solar noon by ~2 hours)
-
-### Verification
-
-- At `hour = temp_phase` (e.g., 14:00): `sun_angle - phase_offset + π/2 = π/2`, `sin(π/2) = 1`, so `temp = temp_base + temp_diurnal` (peak). Correct.
-- At `hour = temp_phase + 12` (e.g., 02:00): `sun_angle - phase_offset + π/2 = π/2 - π = -π/2`, `sin(-π/2) = -1`, so `temp = temp_base - temp_diurnal` (trough). Correct.
-- At `hour = temp_phase + 6` (e.g., 20:00): `sin(0) = 0`, so `temp = temp_base` (mean). Correct — evening is passing through the mean on the way down.
 
 ### Maritime adjustment
 
@@ -102,13 +96,10 @@ Where:
 Each micro field is evolved independently. **Wind speed and direction are not evolved by Proc2** — they are read from the Proc3 wind driver (see [Wind speed model](#4-wind-speed-model-proc3)).
 
 ```
--- Temperature (special: computed from sun position, not relaxed toward a static target)
+-- Temperature (computed from sun position, not relaxed)
 temp = compute_diurnal_temperature(temp_base, temp_diurnal, temp_phase)
 temp = temp - maritime * sea_temp_modifier
 temp = apply_flood_modifier("temp", temp, targets, flood_state, nile_adjacent)
--- Note: temperature is NOT relaxed — it follows the sun directly. This is correct
--- because the diurnal curve IS the target. Maritime and flood adjustments are
--- applied as immediate offsets, not relaxation targets.
 
 -- Humidity (relaxed toward maritime-adjusted target)
 target_humidity = targets.humidity + maritime * sea_humidity_modifier
@@ -135,11 +126,11 @@ new_precip = relax_value(current_precip, target_precip, rate, noise_scale)
 new_visibility = relax_value(current_visibility, target_visibility, rate, noise_scale)
 ```
 
-Temperature is special: the target itself changes throughout the day (it's the diurnal curve), so the processor computes the diurnal target each cycle. There is no relaxation step for temperature — the diurnal curve is the computed value. Maritime and flood adjustments are applied as immediate offsets on top of the diurnal result.
+Temperature is not relaxed — the diurnal curve is the computed value. Maritime and flood adjustments are applied as immediate offsets.
 
 ### Maritime influence
 
-The maritime factor modifies the relaxation **target** for humidity, and applies a direct offset to temperature. It does not modify the computed value directly — this way the relaxation model naturally incorporates the maritime effect, and values vary smoothly with wind direction.
+The maritime factor modifies the relaxation **target** for humidity, and applies a direct offset to temperature. It modifies the target, not the computed value, so the relaxation model incorporates the maritime effect without a separate adjustment step.
 
 ```
 function compute_maritime_influence(wind_dir_degrees, sea_direction)
@@ -166,7 +157,7 @@ Both `sea_temp_modifier` and `sea_humidity_modifier` are configurable per-grid i
 
 ### Target interpolation (two-phase transition)
 
-When the grid pushes new targets (via TARGET_PUSH), Proc2 does not apply them instantly. Instead it stores the old targets and interpolates all numeric fields toward the new values over a ramp period. This produces smooth transitions between weather states — temperature, humidity, pressure, and wind modifiers ramp gradually rather than snapping.
+When the grid pushes new targets (via TARGET_PUSH), Proc2 does not apply them instantly. It stores the old targets and interpolates all numeric fields toward the new values over a ramp period, so temperature, humidity, pressure, and wind modifiers ramp gradually rather than snapping.
 
 ```
 progress = 1.0 - (ramp_remaining / ramp_total)
@@ -183,7 +174,7 @@ Each cycle, `ramp_remaining` is decremented. When it reaches 0, `effective_targe
 
 Non-numeric fields (`eep_preset`, `particle`) switch instantly at the start of the ramp, since they cannot be meaningfully interpolated. Only numeric fields (temperature, humidity, pressure, wind modifiers, visibility, dust, precipitation) are ramped.
 
-The ramp duration comes from `wind_ramp_seconds` in the targets (default: 300s). This is the same value Proc3 uses for its wind modifier interpolation (see [Wind speed model](#4-wind-speed-model-proc3)), so wind speed and direction transitions are synchronised with the broader state transition.
+The ramp duration comes from `wind_ramp_seconds` in the targets (default: 300s) — the same value Proc3 uses for its wind modifier interpolation (see [Wind speed model](#4-wind-speed-model-proc3)), keeping wind and broader state transitions synchronised.
 
 ## 3. Wind direction interpolation
 
@@ -237,7 +228,7 @@ local cardinal_to_deg = {
 
 ## 4. Wind speed model (Proc3)
 
-Proc3 generates the wind speed signal independently of Proc2's target parameters. It combines a calm/gust oscillation, diurnal modulation, a pressure-gradient term, and a state-modifier interpolation into a single speed target, then relaxes the current speed toward it with stochastic noise.
+Proc3 generates wind speed independently of Proc2's target parameters, combining calm/gust oscillation, diurnal modulation, pressure-gradient wind, and state-modifier interpolation into a single speed target. The current speed relaxes toward it with stochastic noise.
 
 ### Calm/gust oscillation
 
@@ -254,7 +245,7 @@ Where:
 - Period: 20 minutes = 480 cycles at 2.5s per cycle
 - `phase` — seeded from `llGetUnixTime()` on cold boot, advanced by `2 * math.pi / 480` each cycle
 
-The asymmetric factors mean gusts can be stronger than lulls (or vice versa), producing a more natural oscillation than a symmetric sine.
+The asymmetric factors allow gusts to be stronger than lulls (or vice versa), giving a more natural oscillation than a symmetric sine.
 
 ### Diurnal modulation
 
@@ -268,7 +259,7 @@ diurnal_speed_mod = 1.0 + diurnal * WIND_DIURNAL_SPEED_AMPLITUDE
 Where:
 - `WIND_DIURNAL_SPEED_AMPLITUDE` — fractional change at full day/night (e.g., 0.2 → ±20%)
 
-Daytime (positive `diurnal`) produces stronger wind; nighttime (negative `diurnal`) produces weaker wind. This models the typical afternoon wind maximum driven by thermal turbulence.
+Daytime (positive `diurnal`) produces stronger wind; nighttime (negative `diurnal`) produces weaker wind, modelling the typical afternoon wind maximum driven by thermal turbulence.
 
 ### Diurnal sea breeze shift
 
@@ -322,7 +313,7 @@ Where:
 - `ramp_remaining` — cycles left in the ramp (decremented each cycle)
 - `ramp_total` — the ramp duration in cycles (default: 300s / 2.5s = 120 cycles, from `wind_ramp_seconds` in the targets)
 
-When `ramp_remaining` reaches 0, `current_mod` equals `new_mod` and the ramp is complete. This prevents abrupt wind speed jumps when the grid transitions between weather states.
+When `ramp_remaining` reaches 0, `current_mod` equals `new_mod` and the ramp is complete, preventing abrupt wind speed jumps during state transitions.
 
 ### Speed target
 
@@ -409,7 +400,7 @@ end
 
 ### Season blending
 
-In the last 7 days of each season, the grid gradually biases target parameters toward the next season's baseline. This prevents a hard snap at the boundary.
+In the last 7 days of each season, the grid biases target parameters toward the next season's baseline to avoid a hard snap at the boundary.
 
 ```
 function get_season_blend(month, day)
@@ -535,7 +526,7 @@ function get_flood_state(day_of_year)
 end
 ```
 
-Note: The flood state boundaries use fixed day-of-year ranges. In a leap year, days after Feb 29 are shifted by 1, but the boundaries are approximate enough (the flood doesn't change on an exact date) that this is acceptable. The season lookup avoids this issue entirely by using month/day comparison.
+Flood state boundaries use fixed day-of-year ranges. In a leap year, days after Feb 29 shift by 1, but the boundaries are approximate enough that this is acceptable. Season lookup avoids the issue by using month/day comparison.
 
 ### Applying flood modifiers
 
@@ -559,11 +550,11 @@ function apply_flood_modifier(field_name, field_value, target, flood_state, nile
 end
 ```
 
-The modifier is a delta (e.g., `+15` for `flood_peak_humidity`), applied to the target before the relaxation step. This way the relaxation model naturally smooths the transition when flood state changes.
+The modifier is a delta (e.g., `+15` for `flood_peak_humidity`), applied to the target before relaxation, so the relaxation model smooths the transition when flood state changes.
 
 ## 6. Background pressure driver (Proc3)
 
-Proc3 generates an independent background pressure signal that Proc2 mixes into its pressure evolution. This provides an external forcing function — pressure systems move through regions independently of local weather — giving the grid something other than its own reflected targets to evaluate when making progression decisions.
+Proc3 generates a background pressure signal that Proc2 mixes into its pressure evolution — an external forcing function independent of local weather, giving the grid something other than its own reflected targets to evaluate when making progression decisions.
 
 ### Model
 
@@ -646,7 +637,7 @@ Where:
 - `seasonal_temp_avg` — seasonal mean temperature (updated from grid targets' `temp_base` field)
 - `TEMP_PRESSURE_FACTOR` — hPa change per °C above/below the seasonal mean (default: 0.3)
 
-A temperature 10 °C above the seasonal average produces a -3 hPa offset. This couples heat waves and cold snaps to pressure, reinforcing the progression toward storm or clear conditions.
+A temperature 10 °C above the seasonal average produces a -3 hPa offset, coupling heat waves and cold snaps to pressure and reinforcing progression toward storm or clear conditions.
 
 **Moisture coupling** — humid air is less dense and exerts lower surface pressure:
 
@@ -659,9 +650,9 @@ Where:
 - `seasonal_humidity_avg` — seasonal mean humidity (updated from grid targets' `humidity` field)
 - `HUMIDITY_PRESSURE_FACTOR` — hPa change per % above/below the seasonal mean (default: 0.05)
 
-A humidity 20 % above the seasonal average produces a -1 hPa offset. This is a smaller effect than thermal coupling but adds realism — humid air masses correlate with lower pressure.
+A humidity 20 % above the seasonal average produces a -1 hPa offset — a smaller effect than thermal coupling, but humid air masses do correlate with lower pressure.
 
-The seasonal averages are updated by Proc3 when it reads grid targets: `seasonal_temp_avg` is set to `targets.temp_base` and `seasonal_humidity_avg` is set to `targets.humidity`. This means the coupling responds to the current season's baseline, not a fixed constant.
+The seasonal averages are updated by Proc3 from grid targets: `seasonal_temp_avg` from `targets.temp_base`, `seasonal_humidity_avg` from `targets.humidity`. The coupling responds to the current season's baseline, not a fixed constant.
 
 The total offset combines all terms:
 
@@ -734,11 +725,11 @@ temp/humidity → pressure (thermal/moisture coupling)
             → temp/humidity
 ```
 
-This feedback is self-regulating: a heat wave raises temperature, which lowers pressure, which increases wind, which (if from the sea) cools and humidifies the air, which brings the temperature back down. The loop operates on a timescale of minutes to tens of minutes, producing natural weather oscillations.
+The feedback is self-regulating: a heat wave raises temperature → lowers pressure → increases wind → (if from the sea) cools and humidifies the air → brings temperature back down. The loop operates on a timescale of minutes to tens of minutes.
 
 ## 7. Grid progression logic
 
-The grid uses a **data-driven progression model**. Each state defines `progresses_to`, `regresses_to`, and optionally `diverges_to` paths with conditions specified as notecard fields. Progression conditions are evaluated against **time-windowed trends** computed from timestamped pressure history, not poll counts. This makes the system immune to poll cadence and processor cycle timing — the grid measures real elapsed time and real pressure change, not "how many times I looked."
+The grid uses a **data-driven progression model**. Each state defines `progresses_to`, `regresses_to`, and optionally `diverges_to` paths with conditions specified as notecard fields. Progression conditions are evaluated against **time-windowed trends** computed from timestamped pressure history, not poll counts, making the system immune to poll cadence and processor cycle timing.
 
 ### Pressure history
 
@@ -793,7 +784,7 @@ function compute_pressure_trend(history, window_seconds)
 end
 ```
 
-This is the **authoritative** trend for transition decisions. It is computed from actual pressure readings (which include the Proc3 driver offset mixed in by Proc2), over a 5-minute window at 15-second poll intervals (≈20 readings).
+This is the **authoritative** trend for transition decisions, computed from actual pressure readings (which include the Proc3 driver offset mixed in by Proc2) over a 5-minute window at 15-second poll intervals (≈20 readings).
 
 ### Cross-checking with Proc3's driver trend
 
@@ -842,7 +833,7 @@ Sun phases:
 
 ### Progression conditions
 
-Conditions are **data-driven** — read from the current state's notecard definition, not hardcoded by state name. This makes the progression logic fully configurable without code changes. Each path type has its own condition fields:
+Conditions are **data-driven** — read from the current state's notecard definition, not hardcoded by state name, making the progression logic fully configurable without code changes. Each path type has its own condition fields:
 
 **Progress** (deterioration — e.g., Clear → Cloudy):
 - `progress_trend_max` — trigger if trend < this value (hPa/min, negative = falling)
@@ -1030,16 +1021,16 @@ end
 
 ### Why time-windowed trends, not poll counts
 
-The previous design used a counter incremented when a condition was met and decremented when not. Three consecutive hits triggered a transition. This had two problems:
+The previous design used a counter (3 consecutive hits = transition) with two problems:
 
-1. **Cadence dependency**: "3 consecutive polls" means different things at different poll rates. At 15s polling, that's 45 seconds of evidence. At 120s polling, that's 6 minutes. The threshold's real-time meaning changed with cadence.
-2. **Noise sensitivity**: A brief noise spike lasting 2-3 polls could trigger a transition. The counter didn't distinguish "sustained trend" from "lucky sampling."
+1. **Cadence dependency**: "3 polls" means 45s at 15s polling, 6min at 120s polling. The threshold's real-time meaning changed with cadence.
+2. **Noise sensitivity**: A brief spike lasting 2-3 polls could trigger a transition — no distinction between "sustained trend" and "lucky sampling."
 
-The time-windowed approach fixes both: the trend is computed over a fixed 5-minute window regardless of poll cadence, and linear regression averages out noise. More polls in the window just means better precision — the threshold stays the same in real time.
+The time-windowed approach computes trend over a fixed 5-minute window regardless of poll cadence. Linear regression averages out noise; more polls just mean better precision.
 
 ### Extracting target parameters
 
-When a transition is decided, the grid extracts the target parameters from the new state's notecard definition and sends them via TARGET_PUSH. This includes seasonal wind base values so Proc3 can configure its wind driver (Proc3 is in a different linkset and can't read the grid's `season:` config keys):
+When a transition is decided, the grid extracts target parameters from the new state's notecard definition and sends them via TARGET_PUSH. Seasonal wind base values are included so Proc3 can configure its wind driver (Proc3 is in a different linkset and can't read the grid's `season:` config keys):
 
 ```
 function extract_targets_from_state(state_def, season)
@@ -1122,7 +1113,7 @@ function bootstrap_evaluate(current_values, season)
 end
 ```
 
-This is a one-time call. After the first poll, the grid switches to normal `evaluate_progression()` and never calls `bootstrap_evaluate()` again unless it reboots.
+After the first poll, the grid switches to normal `evaluate_progression()` and never calls `bootstrap_evaluate()` again unless it reboots.
 
 ## 8. Duration parsing
 
