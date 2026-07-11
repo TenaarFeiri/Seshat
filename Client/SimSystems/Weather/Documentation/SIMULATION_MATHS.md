@@ -4,39 +4,67 @@ Reference for the computational models used by the processor scripts and the gri
 
 ## 1. Diurnal temperature
 
-Temperature is computed continuously from the time of day, not stored as a static value. The processor computes this each cycle.
+Temperature is computed continuously from the sun's position, not stored as a static value. Proc2 computes this each cycle using `ll.GetSunDirection()`.
+
+### Why sun direction, not wallclock?
+
+The system originally used `llGetWallclock()` (seconds since midnight in SL time), but this was replaced with `ll.GetSunDirection()` for two critical reasons:
+
+1. **Custom sun cycles**: Many regions run accelerated day/night cycles, eternal noon, or custom sun configurations. `llGetWallclock()` returns SL time which may not correspond to the actual sun position in these regions. The diurnal temperature curve would be out of sync with the visible sun.
+2. **Region restart desync**: `llGetTimeOfDay()` and wallclock can drift after region restarts. The sun direction vector is always authoritative.
+
+`ll.GetSunDirection()` returns a normalized 3D vector pointing toward the sun. SL's sun path: rises in the east (+X), sets in the west (-X), arcs through the sky (+Z at noon, -Z at midnight). We use `atan2(z, x)` to extract the orbital angle and map it to a 24-hour clock.
 
 ### Formula
 
 ```
-hour = llGetWallclock() / 3600  -- seconds since midnight → hours (0 to 24)
-angle = ((hour - temp_phase) / 24) * 2 * math.pi
-temp = temp_base + temp_diurnal * math.cos(angle)
+-- Get the sun direction vector (parcel-scoped)
+sun = ll.GetSunDirection()
+
+-- Derive the orbital angle from the sun's X-Z position.
+-- atan2(z, x) gives: 0 at sunrise (east), π/2 at noon, π at sunset (west),
+-- 3π/2 at midnight. Normalize to [0, 2π).
+angle = math.atan(sun.z, sun.x)
+if angle < 0 then angle = angle + 2 * math.pi end
+
+-- Map angle to 24-hour clock:
+-- sunrise (angle=0) = 6am, noon = 12, sunset = 18, midnight = 0
+hour = (6 + (angle / (2 * math.pi)) * 24) % 24
+
+-- Convert to angular position (0 at midnight, π at noon)
+sun_angle = (hour / 24) * 2 * math.pi
+
+-- Phase offset: temp_phase is the hour of peak temperature (default ~14:00)
+phase_offset = (temp_phase / 24) * 2 * math.pi
+
+-- Temperature follows a sine wave peaking at temp_phase
+temp = temp_base + temp_diurnal * math.sin(sun_angle - phase_offset + math.pi / 2)
 ```
 
 Where:
 - `temp_base` — daily mean temperature (from current target parameters)
 - `temp_diurnal` — half the day/night swing amplitude (from current target parameters)
 - `temp_phase` — hour of peak temperature (typically 14, as peak heat lags solar noon by ~2 hours)
-- `llGetWallclock()` — SL function returning seconds since midnight in SL time
 
 ### Verification
 
-- At `hour = temp_phase` (e.g., 14:00): `angle = 0`, `cos(0) = 1`, so `temp = temp_base + temp_diurnal` (peak). Correct.
-- At `hour = temp_phase + 12` (e.g., 02:00): `angle = π`, `cos(π) = -1`, so `temp = temp_base - temp_diurnal` (trough). Correct.
-- At `hour = temp_phase + 6` (e.g., 20:00): `angle = π/2`, `cos(π/2) = 0`, so `temp = temp_base` (mean). Correct — evening is passing through the mean on the way down.
+- At `hour = temp_phase` (e.g., 14:00): `sun_angle - phase_offset + π/2 = π/2`, `sin(π/2) = 1`, so `temp = temp_base + temp_diurnal` (peak). Correct.
+- At `hour = temp_phase + 12` (e.g., 02:00): `sun_angle - phase_offset + π/2 = π/2 - π = -π/2`, `sin(-π/2) = -1`, so `temp = temp_base - temp_diurnal` (trough). Correct.
+- At `hour = temp_phase + 6` (e.g., 20:00): `sin(0) = 0`, so `temp = temp_base` (mean). Correct — evening is passing through the mean on the way down.
 
-### Why not sun direction?
+### Maritime adjustment
 
-`llGetSunDirection()` returns a 3D vector, and its z-component gives sun elevation. However, mapping elevation to time-of-day is not straightforward — elevation is already a sinusoidal function of time, so using it as an input to another sinusoid produces a distorted curve. The relationship between elevation and time also depends on latitude and season.
+After computing the diurnal temperature, Proc2 applies a maritime cooling/warming effect based on wind direction relative to the sea:
 
-Using `llGetWallclock()` directly gives a clean linear time input, which produces a correct cosine curve. SL's day is approximately 4 hours of real time for 24 hours of sim time, but `llGetWallclock()` already accounts for this — it returns SL time, not real time.
+```
+computed_temp = temp - maritime * sea_temp_modifier
+```
 
-If a region has a non-standard sun configuration (e.g., eternal noon), the diurnal curve will still produce a value, but it won't track the actual sun. That's acceptable — the temperature model is a function of *time*, not *sun position*, and the two are only loosely coupled in reality anyway (thermal lag means peak temperature is not at solar noon).
+Where `maritime` is the cosine of the angular difference between wind direction and `sea_direction` (see [Maritime influence](#maritime-influence)), and `sea_temp_modifier` is a grid-configurable value (default: 1.0 °C at full alignment).
 
 ## 2. State evolution (relaxation model)
 
-The processor evolves each computed value toward its target each cycle using a relaxation model with stochastic noise.
+Proc2 evolves each computed value toward its target each cycle using a relaxation model with stochastic noise.
 
 ### Formula
 
@@ -46,85 +74,95 @@ new_value = current_value + (target_value - current_value) * rate + noise
 
 Where:
 - `current_value` — the last computed value (stored in LSD)
-- `target_value` — the target parameter (from `<grid_uuid>:targets`)
-- `rate` — relaxation rate (0 to 1, from evolution state)
+- `target_value` — the target parameter (from `<grid_uuid>:targets`, possibly interpolated — see [Target interpolation](#target-interpolation-two-phase-transition))
+- `rate` — relaxation rate (0 to 1, currently 0.05)
 - `noise` — stochastic perturbation
 
 ### Relaxation rate
 
 `rate` controls how fast values converge to targets. Higher = faster convergence but less smooth. Lower = more gradual, more natural.
 
-Suggested default: `rate = 0.1` (10% of the gap closed per cycle). With a 7.5-second cycle, this reaches ~95% of target in about 225 seconds (≈30 cycles, since `0.9^30 ≈ 0.04` remaining gap).
-
-For event states (khamsin, storms), a higher rate may be appropriate — these should feel sudden:
-
-```
-if event_state then
-    rate = 0.3  -- faster convergence for dramatic transitions
-else
-    rate = 0.1  -- gradual for normal state changes
-end
-```
+Current default: `rate = 0.05` (5% of the gap closed per cycle). With a 7.5-second cycle, this reaches ~95% of target in about 450 seconds (≈60 cycles, since `0.95^60 ≈ 0.046` remaining gap).
 
 ### Noise
 
-Noise prevents the evolution from looking mechanical. It should be scaled to the value's natural variability:
+Noise prevents the evolution from looking mechanical. It is scaled to the distance from the target:
 
 ```
-noise = (math.random() - 0.5) * 2 * noise_scale * variability
+noise = (math.random() - 0.5) * 2 * noise_scale * math.abs(target_value - current_value + 1)
 ```
 
 Where:
 - `math.random()` returns 0 to 1, so `(math.random() - 0.5) * 2` gives -1 to 1
-- `noise_scale` — from evolution state (suggested default: 0.05, i.e. ±5% of variability)
-- `variability` — the field's variability parameter (e.g., `wind_variability` for wind speed)
-
-For wind, which has its own `wind_variability` field:
-
-```
-wind_noise = (math.random() - 0.5) * 2 * noise_scale * wind_variability * target_wind_speed
-new_wind_speed = current_wind_speed + (target_wind_speed - current_wind_speed) * rate + wind_noise
-```
-
-For fields without a specific variability parameter (humidity, pressure, dust, etc.), use a small fixed noise scale:
-
-```
-field_noise = (math.random() - 0.5) * 2 * 0.02 * target_value  -- ±2% of target
-```
+- `noise_scale` — stochastic perturbation scale (default: 0.05, i.e. ±5%)
+- `math.abs(target_value - current_value + 1)` — scales noise with the remaining gap, so noise diminishes as values converge. The `+1` prevents zero noise when the value is exactly at target.
 
 ### Per-field application
 
-Each micro field is evolved independently:
+Each micro field is evolved independently. **Wind speed and direction are not evolved by Proc2** — they are read from the Proc3 wind driver (see [Wind speed model](#4-wind-speed-model-proc3)).
 
 ```
--- Temperature (special: uses diurnal formula, not pure relaxation)
-temp = diurnal_temp(temp_base, temp_diurnal, temp_phase, sun)
--- Then apply relaxation toward the diurnal result (smooths day-to-day transitions)
-new_temp = current_temp + (temp - current_temp) * rate + temp_noise
+-- Temperature (special: computed from sun position, not relaxed toward a static target)
+temp = compute_diurnal_temperature(temp_base, temp_diurnal, temp_phase)
+temp = temp - maritime * sea_temp_modifier
+temp = apply_flood_modifier("temp", temp, targets, flood_state, nile_adjacent)
+-- Note: temperature is NOT relaxed — it follows the sun directly. This is correct
+-- because the diurnal curve IS the target. Maritime and flood adjustments are
+-- applied as immediate offsets, not relaxation targets.
 
--- Humidity
-new_humidity = current_humidity + (target_humidity - current_humidity) * rate + humidity_noise
+-- Humidity (relaxed toward maritime-adjusted target)
+target_humidity = targets.humidity + maritime * sea_humidity_modifier
+target_humidity = apply_flood_modifier("humidity", target_humidity, targets, ...)
+new_humidity = relax_value(current_humidity, target_humidity, rate, noise_scale)
 
--- Pressure
-new_pressure = current_pressure + (target_pressure - current_pressure) * rate + pressure_noise
+-- Pressure (relaxed toward target, then driver offset added)
+evolved_pressure = relax_value(current_pressure, target_pressure, rate, noise_scale)
+computed_pressure = evolved_pressure + pressure_driver_offset
 
--- Wind speed
-new_wind_speed = current_wind_speed + (target_wind_speed - current_wind_speed) * rate + wind_noise
+-- Wind speed and direction: read from Proc3 driver (not relaxed here)
+wind_driver = read_lsd("drivers:wind")
+computed_wind_speed = wind_driver.speed
+computed_wind_dir = wind_driver.direction
 
--- Wind direction (special: circular interpolation, see below)
-new_wind_dir = circular_lerp(current_wind_dir, target_wind_dir, rate)
+-- Dust (relaxed toward flood-modified target)
+target_dust = apply_flood_modifier("dust", targets.dust, targets, ...)
+new_dust = relax_value(current_dust, target_dust, rate, noise_scale)
 
--- Dust
-new_dust = current_dust + (target_dust - current_dust) * rate + dust_noise
+-- Precipitation (relaxed toward target)
+new_precip = relax_value(current_precip, target_precip, rate, noise_scale)
 
--- Precipitation
-new_precip = current_precip + (target_precip - current_precip) * rate + precip_noise
-
--- Visibility
-new_visibility = current_visibility + (target_visibility - current_visibility) * rate
+-- Visibility (relaxed toward target)
+new_visibility = relax_value(current_visibility, target_visibility, rate, noise_scale)
 ```
 
-Temperature is special: the *target* itself changes throughout the day (it's the diurnal curve), so the processor computes the diurnal target each cycle and relaxes toward it. This means temperature is always chasing a moving target, which naturally produces smooth day-night transitions.
+Temperature is special: the target itself changes throughout the day (it's the diurnal curve), so the processor computes the diurnal target each cycle. There is no relaxation step for temperature — the diurnal curve is the computed value. Maritime and flood adjustments are applied as immediate offsets on top of the diurnal result.
+
+### Maritime influence
+
+The maritime factor modifies the relaxation **target** for humidity, and applies a direct offset to temperature. It does not modify the computed value directly — this way the relaxation model naturally incorporates the maritime effect, and values vary smoothly with wind direction.
+
+```
+function compute_maritime_influence(wind_dir_degrees, sea_direction)
+    if not sea_direction then return 0 end
+
+    local sea_dir_degrees = cardinal_to_degrees(sea_direction)
+    local angular_diff = wind_dir_degrees - sea_dir_degrees
+
+    -- Normalize to -180..180
+    while angular_diff > 180 do angular_diff = angular_diff - 360 end
+    while angular_diff < -180 do angular_diff = angular_diff + 360 end
+
+    -- Cosine of the angular difference: 1.0 = from sea, -1.0 = from opposite
+    return math.cos(angular_diff * math.pi / 180)
+end
+```
+
+The maritime factor ranges from -1.0 (wind from opposite of sea, i.e. continental/desert) to +1.0 (wind directly from sea). It affects:
+
+- **Temperature**: `computed_temp = diurnal_temp - maritime * sea_temp_modifier` (positive maritime = from sea = cooler)
+- **Humidity target**: `target_humidity = targets.humidity + maritime * sea_humidity_modifier` (positive maritime = from sea = more humid)
+
+Both `sea_temp_modifier` and `sea_humidity_modifier` are configurable per-grid in the `{grid}` section of the notecard (defaults: 1.0 °C and 8.0 percentage points at full alignment).
 
 ### Target interpolation (two-phase transition)
 
@@ -138,10 +176,10 @@ effective_target = old_target + (new_target - old_target) * progress
 Where:
 - `old_target` — the target value at the moment the new targets arrived
 - `new_target` — the incoming target value from TARGET_PUSH
-- `ramp_remaining` — seconds left in the ramp (decremented each cycle)
-- `ramp_total` — the ramp duration in seconds (from `wind_ramp_seconds` in the targets, default: 300s)
+- `ramp_remaining` — cycles left in the ramp (decremented each cycle)
+- `ramp_total` — the ramp duration in cycles (from `wind_ramp_seconds` in the targets, converted to cycles: `floor(ramp_seconds / 7.5)`)
 
-Each cycle, `ramp_remaining` is decremented by the cycle interval. When it reaches 0, `effective_target` equals `new_target` and the ramp is complete — Proc2 then uses `new_target` directly.
+Each cycle, `ramp_remaining` is decremented. When it reaches 0, `effective_target` equals `new_target` and the ramp is complete — Proc2 then uses `new_target` directly.
 
 Non-numeric fields (`eep_preset`, `particle`) switch instantly at the start of the ramp, since they cannot be meaningfully interpolated. Only numeric fields (temperature, humidity, pressure, wind modifiers, visibility, dust, precipitation) are ramped.
 
@@ -197,52 +235,6 @@ local cardinal_to_deg = {
 }
 ```
 
-### Diurnal sea breeze shift
-
-Proc3 applies a diurnal modulation to wind direction, shifting the target toward a sea breeze during the day and away at night. The diurnal factor is the sun direction's z-component (sun elevation), clamped to -1…+1:
-
-```
-diurnal = math.max(-1, math.min(1, ll.GetSunDirection().z))
-```
-
-The shift magnitude is proportional to the shortest angular path from the base direction to the configured `sea_direction`:
-
-```
--- sea_delta: shortest angular path from base_dir to sea_direction (-180 to +180)
-sea_delta = (sea_direction - base_dir + 540) % 360 - 180
-
-dir_target = base_dir + wind_dir_mod + sea_delta * diurnal * (WIND_DIURNAL_DIR_SHIFT / 180)
-```
-
-Where:
-- `sea_delta` — shortest angular distance from `base_dir` to `sea_direction` (degrees, -180 to +180)
-- `diurnal` — sun elevation factor (-1 at night, +1 at noon)
-- `WIND_DIURNAL_DIR_SHIFT` — maximum shift in degrees at full daytime (e.g., 30)
-
-Daytime (positive `diurnal`) shifts the target toward `sea_direction` (onshore breeze). Nighttime (negative `diurnal`) shifts it away (offshore). The `wind_dir_mod` term is the state-specific direction modifier interpolated by Proc2 (see [Target interpolation](#target-interpolation-two-phase-transition)).
-
-### Direction noise
-
-Stochastic perturbation prevents the direction from looking mechanical:
-
-```
-dir_noise = (math.random() - 0.5) * 2 * WIND_DIR_NOISE_DEGREES * variability
-```
-
-Where:
-- `WIND_DIR_NOISE_DEGREES` — maximum noise swing in degrees (default: 30)
-- `variability` — the wind variability factor for the current state
-
-### Direction relaxation
-
-The current direction relaxes toward the computed target using circular interpolation:
-
-```
-wind_current_dir = circular_lerp(wind_current_dir, dir_target, WIND_DIR_RELAX_RATE)
-```
-
-Where `WIND_DIR_RELAX_RATE` is the per-cycle relaxation rate (default: 0.03). At a 2.5-second cycle this reaches ~95% of target in about 250 seconds (≈100 cycles, since `0.97^100 ≈ 0.048` remaining gap).
-
 ## 4. Wind speed model (Proc3)
 
 Proc3 generates the wind speed signal independently of Proc2's target parameters. It combines a calm/gust oscillation, diurnal modulation, a pressure-gradient term, and a state-modifier interpolation into a single speed target, then relaxes the current speed toward it with stochastic noise.
@@ -278,6 +270,30 @@ Where:
 
 Daytime (positive `diurnal`) produces stronger wind; nighttime (negative `diurnal`) produces weaker wind. This models the typical afternoon wind maximum driven by thermal turbulence.
 
+### Diurnal sea breeze shift
+
+Proc3 applies a diurnal modulation to wind direction, shifting the target toward a sea breeze during the day and away at night. The diurnal factor is the sun direction's z-component (sun elevation), clamped to -1…+1:
+
+```
+diurnal = math.max(-1, math.min(1, ll.GetSunDirection().z))
+```
+
+The shift magnitude is proportional to the shortest angular path from the base direction to the configured `sea_direction`:
+
+```
+-- sea_delta: shortest angular path from base_dir to sea_direction (-180 to +180)
+sea_delta = (sea_direction - base_dir + 540) % 360 - 180
+
+dir_target = base_dir + wind_dir_mod + sea_delta * diurnal * (WIND_DIURNAL_DIR_SHIFT / 180)
+```
+
+Where:
+- `sea_delta` — shortest angular distance from `base_dir` to `sea_direction` (degrees, -180 to +180)
+- `diurnal` — sun elevation factor (-1 at night, +1 at noon)
+- `WIND_DIURNAL_DIR_SHIFT` — maximum shift in degrees at full daytime (default: 30)
+
+Daytime (positive `diurnal`) shifts the target toward `sea_direction` (onshore breeze). Nighttime (negative `diurnal`) shifts it away (offshore). The `wind_dir_mod` term is the state-specific direction modifier interpolated by Proc3 (see [State modifier interpolation](#state-modifier-interpolation)).
+
 ### Pressure gradient wind
 
 Proc3 reads the pressure trend from `drivers:pressure` (written by its own pressure driver) and converts it into a gradient wind component:
@@ -287,14 +303,14 @@ gradient_wind = -pressure_trend_hpa_per_min * GRADIENT_WIND_FACTOR
 ```
 
 Where:
-- `pressure_trend_hpa_per_min` — rate of pressure change in hPa per minute (from `drivers:pressure.trend`)
+- `pressure_trend_hpa_per_min` — rate of pressure change in hPa per minute (from `drivers:pressure.trend`, converted from hPa/cycle to hPa/min by dividing by `COMPUTE_INTERVAL_SECONDS`)
 - `GRADIENT_WIND_FACTOR` — conversion constant (default: 50)
 
 Falling pressure (negative trend) produces a positive `gradient_wind` (stronger wind), modelling the increased wind ahead of an approaching low. Rising pressure produces weaker wind.
 
 ### State modifier interpolation
 
-When Proc2 pushes new targets (via TARGET_PUSH), the `wind_speed_mod` field may change. Proc3 does not apply the new modifier instantly — it interpolates from the old value to the new value over a ramp period:
+When Proc2 pushes new targets (via TARGET_PUSH), the `wind_speed_mod` and `wind_dir_mod` fields may change. Proc3 does not apply the new modifiers instantly — it interpolates from the old values to the new values over a ramp period:
 
 ```
 current_mod = old_mod + (new_mod - old_mod) * (1 - ramp_remaining / ramp_total)
@@ -303,8 +319,8 @@ current_mod = old_mod + (new_mod - old_mod) * (1 - ramp_remaining / ramp_total)
 Where:
 - `old_mod` — the modifier value at the start of the ramp
 - `new_mod` — the target modifier from the new targets
-- `ramp_remaining` — seconds left in the ramp (decremented each cycle)
-- `ramp_total` — the ramp duration in seconds (default: 300s, from `wind_ramp_seconds` in the targets)
+- `ramp_remaining` — cycles left in the ramp (decremented each cycle)
+- `ramp_total` — the ramp duration in cycles (default: 300s / 2.5s = 120 cycles, from `wind_ramp_seconds` in the targets)
 
 When `ramp_remaining` reaches 0, `current_mod` equals `new_mod` and the ramp is complete. This prevents abrupt wind speed jumps when the grid transitions between weather states.
 
@@ -340,9 +356,29 @@ wind_current_speed = wind_current_speed
 Where:
 - `WIND_SPEED_RELAX_RATE` — per-cycle relaxation rate (default: 0.03)
 - `WIND_NOISE_SCALE` — noise amplitude as a fraction of base speed (default: 0.05, i.e. ±5%)
-- `variability` — the wind variability factor for the current state
+- `variability` — the wind variability factor for the current state (seasonal `wind_variability` + state `wind_variability_mod`)
 
 At a 2.5-second cycle with `WIND_SPEED_RELAX_RATE = 0.03`, the speed reaches ~95% of target in about 250 seconds (≈100 cycles).
+
+### Direction noise and relaxation
+
+Stochastic perturbation prevents the direction from looking mechanical:
+
+```
+dir_noise = (math.random() - 0.5) * 2 * WIND_DIR_NOISE_DEGREES * variability
+```
+
+Where:
+- `WIND_DIR_NOISE_DEGREES` — maximum noise swing in degrees (default: 30)
+- `variability` — the wind variability factor for the current state
+
+The current direction relaxes toward the computed target using circular interpolation:
+
+```
+wind_current_dir = circular_lerp(wind_current_dir, dir_target, WIND_DIR_RELAX_RATE)
+```
+
+Where `WIND_DIR_RELAX_RATE` is the per-cycle relaxation rate (default: 0.03). At a 2.5-second cycle this reaches ~95% of target in about 250 seconds (≈100 cycles, since `0.97^100 ≈ 0.048` remaining gap).
 
 ## 5. Season and flood state computation
 
@@ -503,17 +539,16 @@ Note: The flood state boundaries use fixed day-of-year ranges. In a leap year, d
 
 ### Applying flood modifiers
 
-When Proc2 computes humidity (or any field with flood modifiers), it checks the current flood state and applies the relevant delta:
+When Proc2 computes humidity (or any field with flood modifiers), it checks the current flood state and applies the relevant delta to the **target** before relaxation:
 
 ```
-function apply_flood_modifiers(field_value, target, flood_state, nile_adjacent)
+function apply_flood_modifier(field_name, field_value, target, flood_state, nile_adjacent)
     if not nile_adjacent then
         return field_value  -- no modifiers for non-riverine grids
     end
 
-    -- target is the weather state's parameter table
     -- flood modifiers are named flood_<state>_<field> in the target
-    local modifier_key = "flood_" .. flood_state .. "_humidity"
+    local modifier_key = "flood_" .. flood_state .. "_" .. field_name
     local modifier = target[modifier_key]
 
     if modifier then
@@ -524,7 +559,7 @@ function apply_flood_modifiers(field_value, target, flood_state, nile_adjacent)
 end
 ```
 
-The modifier is a delta (e.g., `+15` for `flood_peak_humidity`), applied after the relaxation step but before writing to LSD.
+The modifier is a delta (e.g., `+15` for `flood_peak_humidity`), applied to the target before the relaxation step. This way the relaxation model naturally smooths the transition when flood state changes.
 
 ## 6. Background pressure driver (Proc3)
 
@@ -537,7 +572,7 @@ A slow sinusoidal wave with stochastic noise, simulating passing pressure system
 ```
 -- Proc3 maintains internal state across cycles:
 --   pressure_phase: current phase of the sinusoidal wave (radians)
---   pressure_period: cycles per full wave (e.g., 480 = 20 minutes at 2.5s cycles)
+--   pressure_period: cycles per full wave (480 = 20 minutes at 2.5s cycles)
 
 function compute_pressure_driver(state)
     -- Advance phase
@@ -570,20 +605,18 @@ function compute_pressure_driver(state)
 
     -- Thermal coupling: warm air above seasonal mean → lower pressure
     local conditions = read_lsd("drivers:conditions")  -- written by Proc2
-    local temp = conditions.temp or 0
-    local seasonal_temp_avg = conditions.seasonal_temp_avg or 0
+    local temp = conditions.temp or seasonal_temp_avg
     local thermal_offset = -(temp - seasonal_temp_avg) * TEMP_PRESSURE_FACTOR
 
     -- Moisture coupling: moist air above seasonal mean → lower pressure
-    local humidity = conditions.humidity or 0
-    local seasonal_humidity_avg = conditions.seasonal_humidity_avg or 0
+    local humidity = conditions.humidity or seasonal_humidity_avg
     local moisture_offset = -(humidity - seasonal_humidity_avg) * HUMIDITY_PRESSURE_FACTOR
 
     local total_offset = base_offset + noise + dip_offset
                          + thermal_offset + moisture_offset
 
     -- Compute trend (rate of change) from last few offsets
-    -- Store last 10 offsets for trend computation
+    -- Store last 10 offsets for trend computation (25-second window)
     if not state.offset_history then state.offset_history = {} end
     table.insert(state.offset_history, total_offset)
     if #state.offset_history > 10 then table.remove(state.offset_history, 1) end
@@ -610,7 +643,7 @@ thermal_offset = -(temp - seasonal_temp_avg) * TEMP_PRESSURE_FACTOR
 
 Where:
 - `temp` — current computed temperature (from `drivers:conditions`)
-- `seasonal_temp_avg` — seasonal mean temperature (from `drivers:conditions`)
+- `seasonal_temp_avg` — seasonal mean temperature (updated from grid targets' `temp_base` field)
 - `TEMP_PRESSURE_FACTOR` — hPa change per °C above/below the seasonal mean (default: 0.3)
 
 A temperature 10 °C above the seasonal average produces a -3 hPa offset. This couples heat waves and cold snaps to pressure, reinforcing the progression toward storm or clear conditions.
@@ -623,10 +656,12 @@ moisture_offset = -(humidity - seasonal_humidity_avg) * HUMIDITY_PRESSURE_FACTOR
 
 Where:
 - `humidity` — current computed humidity (from `drivers:conditions`)
-- `seasonal_humidity_avg` — seasonal mean humidity (from `drivers:conditions`)
+- `seasonal_humidity_avg` — seasonal mean humidity (updated from grid targets' `humidity` field)
 - `HUMIDITY_PRESSURE_FACTOR` — hPa change per % above/below the seasonal mean (default: 0.05)
 
 A humidity 20 % above the seasonal average produces a -1 hPa offset. This is a smaller effect than thermal coupling but adds realism — humid air masses correlate with lower pressure.
+
+The seasonal averages are updated by Proc3 when it reads grid targets: `seasonal_temp_avg` is set to `targets.temp_base` and `seasonal_humidity_avg` is set to `targets.humidity`. This means the coupling responds to the current season's baseline, not a fixed constant.
 
 The total offset combines all terms:
 
@@ -650,7 +685,7 @@ The result: computed pressure oscillates around the grid's target, but the backg
 
 ### How Proc1 exposes the trend
 
-Proc1 reads `drivers:pressure` and includes the trend in `<grid_uuid>:macro:evolution` so the grid can evaluate it via STATE_RESP:
+Proc1 reads `drivers:pressure` and includes the trend in `<grid_uuid>:macro:evolution` so the grid can cross-check it via STATE_RESP:
 
 ```
 local pressure_driver = read_lsd("drivers:pressure")
@@ -660,9 +695,11 @@ evolution.pressure_driver_offset = pressure_driver.offset
 write_lsd("<grid_uuid>:macro:evolution", evolution)
 ```
 
-The grid reads `pressure_trend` from the STATE_RESP payload and uses it in progression condition evaluation. This is the independent signal that breaks the circular dependency.
+The grid reads `pressure_trend` from the STATE_RESP payload for cross-checking, but uses its own time-windowed trend (computed from actual pressure readings) for transition decisions. See [Cross-checking with Proc3's driver trend](#cross-checking-with-proc3s-driver-trend).
 
-### Trend computation
+### Trend computation (Proc3)
+
+Proc3 computes trend from a rolling 10-entry offset history (25-second window at 2.5s cycles) using linear regression:
 
 ```
 function compute_trend(history)
@@ -682,20 +719,26 @@ function compute_trend(history)
 end
 ```
 
-### Interpretation
+This trend is in hPa/cycle. Proc3 converts it to hPa/min for the gradient wind calculation by dividing by `COMPUTE_INTERVAL_SECONDS` (2.5s).
 
-| Trend (hPa/cycle) | Meaning |
-|---|---|
-| > +0.1 | Rising pressure — improving conditions, clearing weather |
-| -0.1 to +0.1 | Stable — no progression pressure |
-| -0.3 to -0.1 | Falling — deterioration, progression toward cloudy/rain likely |
-| < -0.3 | Rapidly falling — khamsin or storm divergence likely |
+### Feedback loop
 
-These thresholds are per-cycle at 2.5-second cycles. Scale accordingly for different cycle lengths.
+The pressure-wind coupling creates a feedback loop:
+
+```
+temp/humidity → pressure (thermal/moisture coupling)
+            → pressure trend
+            → gradient wind
+            → wind direction
+            → maritime influence
+            → temp/humidity
+```
+
+This feedback is self-regulating: a heat wave raises temperature, which lowers pressure, which increases wind, which (if from the sea) cools and humidifies the air, which brings the temperature back down. The loop operates on a timescale of minutes to tens of minutes, producing natural weather oscillations.
 
 ## 7. Grid progression logic
 
-The grid uses a **staged progression model**. Each state defines `progresses_to`, `regresses_to`, and optionally `diverges_to` paths. Progression conditions are evaluated against **time-windowed trends** computed from timestamped pressure history, not poll counts. This makes the system immune to poll cadence and processor cycle timing — the grid measures real elapsed time and real pressure change, not "how many times I looked."
+The grid uses a **data-driven progression model**. Each state defines `progresses_to`, `regresses_to`, and optionally `diverges_to` paths with conditions specified as notecard fields. Progression conditions are evaluated against **time-windowed trends** computed from timestamped pressure history, not poll counts. This makes the system immune to poll cadence and processor cycle timing — the grid measures real elapsed time and real pressure change, not "how many times I looked."
 
 ### Pressure history
 
@@ -750,134 +793,208 @@ function compute_pressure_trend(history, window_seconds)
 end
 ```
 
+This is the **authoritative** trend for transition decisions. It is computed from actual pressure readings (which include the Proc3 driver offset mixed in by Proc2), over a 5-minute window at 15-second poll intervals (≈20 readings).
+
 ### Cross-checking with Proc3's driver trend
 
-The grid also receives `pressure_trend` from Proc3 via `macro:evolution` in each STATE_RESP. This is Proc3's own trend computation from the background pressure driver. The grid can cross-check its local trend against Proc3's trend:
+The grid also receives `pressure_trend` from Proc3 via `macro:evolution` in each STATE_RESP. This is Proc3's own trend computation from the background pressure driver offset history (25-second window). The two trends are independent computations:
 
-- **Both agree** (same sign, similar magnitude): the signal is real — proceed with progression evaluation.
-- **They disagree**: the grid's local trend is more trustworthy because it's computed over a longer window (5 min vs Proc3's rolling 10-cycle window). Use the local trend.
-- **Local trend is near zero but Proc3 reports steep trend**: the processor hasn't caught up yet (relaxation lag). Wait — the computed values will shift soon.
+| Metric | Grid (compute_pressure_trend) | Proc3 (driver trend) |
+|--------|-------------------------------|----------------------|
+| Source | Actual pressure readings | Driver offset history |
+| Window | 300 seconds (5 min) | 25 seconds (10 cycles) |
+| Unit | hPa/min | hPa/cycle |
+| Purpose | Transition decisions | Cross-checking + gradient wind |
 
-This cross-check is advisory, not gating. The grid's local trend is the primary input for progression decisions.
+The grid's local trend is the primary input for progression decisions. The Proc3 trend is advisory — it responds faster (25s vs 5min) but is noisier. The grid uses its own slower, smoother trend for actual transition decisions.
+
+### Sun phase detection
+
+The grid uses `ll.GetSunDirection()` to determine the current sun phase for time-of-day-gated transitions. This respects custom sun cycles, accelerated days, and eternal-noon regions.
+
+```
+function get_sun_phase()
+    local sun = ll.GetSunDirection()
+    local z = sun.z  -- elevation
+    local x = sun.x  -- east-west position
+
+    if z <= 0 then
+        return "night"     -- sun below horizon
+    end
+
+    if z < 0.5 then
+        if x > 0 then
+            return "morning"   -- sun rising in the east (+X), low elevation
+        else
+            return "evening"   -- sun setting in the west (-X), low elevation
+        end
+    end
+
+    return "day"  -- sun high in the sky
+end
+```
+
+Sun phases:
+- `morning`: sun above horizon but low (`z < 0.5`) and in the eastern half (`x > 0`)
+- `day`: sun above horizon and high (`z >= 0.5`)
+- `evening`: sun above horizon but low and in the western half (`x < 0`)
+- `night`: sun below horizon (`z <= 0`)
 
 ### Progression conditions
 
-Conditions are evaluated against the time-windowed trend (hPa/min) and current values:
+Conditions are **data-driven** — read from the current state's notecard definition, not hardcoded by state name. This makes the progression logic fully configurable without code changes. Each path type has its own condition fields:
+
+**Progress** (deterioration — e.g., Clear → Cloudy):
+- `progress_trend_max` — trigger if trend < this value (hPa/min, negative = falling)
+- `progress_humidity_min` — trigger if humidity > this value
+- `progress_morning` / `progress_day` / `progress_evening` / `progress_night` — sun-phase gates
+- `progress_logic` — `"and"` or `"or"` (default: `"or"`). Sun-phase flags are always ANDed.
+
+**Regress** (clearing — e.g., Storm → Rain):
+- `regress_trend_min` — trigger if trend > this value (hPa/min, positive = rising)
+- `regress_humidity_max` — trigger if humidity < this value
+- `regress_morning` / `regress_day` / `regress_evening` / `regress_night` — sun-phase gates
+- `regress_logic` — `"and"` or `"or"` (default: `"and"`). Sun-phase flags are always ANDed.
+
+**Diverge** (event emergence — e.g., Clear → Khamsin):
+- `diverge_pressure_max` — trigger if absolute pressure < this value
+- `diverge_trend_max` — trigger if trend < this value (rapid drop)
+- `diverge_humidity_min` / `diverge_humidity_max` — humidity bounds
+- `diverge_temp_min` — trigger if temperature > this value
+- `diverge_wind_speed_min` / `diverge_wind_speed_max` — wind speed bounds
+- `diverge_morning` / `diverge_day` / `diverge_evening` / `diverge_night` — sun-phase gates
+- `diverge_logic` — `"and"` or `"or"` (default: `"and"`). Sun-phase flags are always ANDed.
+
+### Per-target condition overrides
+
+When a state has multiple progression or divergence targets (comma-separated), conditions can be set for **each target individually** using slotted keys. The target name has spaces replaced with underscores:
 
 ```
-function check_progression_condition(path_type, candidate, local_trend, current_values)
+diverges_to = Heat Wave, Coastal Mist, Sirocco
+diverge_Heat_Wave_temp_min = 30
+diverge_Heat_Wave_day = true
+diverge_Coastal_Mist_humidity_min = 75
+diverge_Coastal_Mist_morning = true
+diverge_Sirocco_humidity_max = 55
+diverge_Sirocco_pressure_max = 1006
+```
+
+If a per-target key exists (e.g., `diverge_Heat_Wave_temp_min`), it overrides the base key (`diverge_temp_min`) for that target. If no per-target key exists, the base key is used. The `*_logic` and sun-phase flags can also be overridden per target. See [NOTECARD_FORMAT.md](NOTECARD_FORMAT.md) for the full schema.
+
+### Condition evaluation
+
+```
+function check_progression_condition(path_type, current_state_def, target_name,
+                                     local_trend, current_values)
     local pressure = current_values.pressure or 1013
     local humidity = current_values.humidity or 50
+    local temp = current_values.temp or 25
+    local wind_speed = current_values.wind_speed or 0
+
+    -- Look up condition values, preferring per-target overrides over base keys
+    -- e.g. diverge_Heat_Wave_temp_min overrides diverge_temp_min
 
     if path_type == "progress" then
-        -- Deterioration: sustained pressure drop over 5 min
-        if candidate.name:find("Cloudy") then
-            return local_trend < -0.05 or humidity > 70
-        elseif candidate.name:find("Rain") then
-            return local_trend < -0.1 and humidity > 72
-        elseif candidate.name:find("Storm") or candidate.name:find("Thunder") then
-            return local_trend < -0.2 and humidity > 75
+        local trend_threshold = get_condition_value("progress", target_name, "trend_max")
+        local humidity_threshold = get_condition_value("progress", target_name, "humidity_min")
+        local logic = get_condition_value("progress", target_name, "logic") or "or"
+
+        if not trend_threshold and not humidity_threshold then return false end
+
+        -- Sun-phase gate (ANDed with other conditions)
+        if not sun_phase_allowed("progress", target_name) then return false end
+
+        local trend_met = trend_threshold and local_trend < trend_threshold
+        local humidity_met = humidity_threshold and humidity > humidity_threshold
+
+        if logic == "and" then
+            return all_defined_conditions_met(trend_met, humidity_met)
+        else
+            return trend_met or humidity_met
         end
-        return false
 
     elseif path_type == "regress" then
-        -- Clearing: sustained pressure rise over 5 min
-        if candidate.name == "Clear Skies" then
-            return local_trend > 0.05 and humidity < 65
-        elseif candidate.name:find("Partly Cloudy") then
-            return local_trend > 0 or humidity < 70
-        end
-        return false
+        -- Similar structure, using regress_* fields
+        -- Default logic: "and" (both conditions must confirm clearing)
 
     elseif path_type == "diverge" then
-        -- Event: rapid sustained drop over 5 min + absolute threshold
-        if candidate.event and pressure < 1008 and local_trend < -0.3 then
-            return true
-        end
-        return false
+        -- Supports: pressure_max, trend_max, humidity_min, humidity_max,
+        -- temp_min, wind_speed_min, wind_speed_max, sun-phase flags
+        -- Default logic: "and" (all conditions must align for event emergence)
     end
-
-    return false
 end
 ```
 
 ### Progression evaluation
 
 ```
-function evaluate_progression(current_state, state_defs, current_values,
-                              pressure_history, transition_state)
-    -- Don't transition if in cooldown
+function evaluate_progression(current_state_def, season, current_values, transition_state)
+    -- Don't transition if in cooldown (6 cycles = 90 seconds at 15s polls)
     if transition_state.cooldown > 0 then
         transition_state.cooldown = transition_state.cooldown - 1
         return nil
     end
 
-    -- Compute time-windowed trend (5 minutes)
-    local local_trend = compute_pressure_trend(pressure_history, 300)
+    -- Don't evaluate if minimum duration hasn't been reached
+    local duration_timer = (transition_state.duration_timer or 0) + 1
+    transition_state.duration_timer = duration_timer
+    if duration_timer < (transition_state.duration_min or 0) then
+        return nil
+    end
 
-    -- Gather all candidate paths from current state
-    local candidates = {}
-    if current_state.progresses_to then
-        for _, name in ipairs(split(current_state.progresses_to, ",")) do
-            table.insert(candidates, {type = "progress", name = trim(name)})
-        end
-    end
-    if current_state.regresses_to then
-        for _, name in ipairs(split(current_state.regresses_to, ",")) do
-            table.insert(candidates, {type = "regress", name = trim(name)})
-        end
-    end
-    if current_state.diverges_to then
-        for _, name in ipairs(split(current_state.diverges_to, ",")) do
-            table.insert(candidates, {type = "diverge", name = trim(name)})
-        end
-    end
+    -- Compute time-windowed trend (5 minutes)
+    local local_trend = compute_pressure_trend(transition_state.pressure_history, 300)
+
+    -- Gather all candidate paths (progresses_to, regresses_to, diverges_to)
+    local candidates = gather_progression_candidates(current_state_def)
 
     -- Check which candidates have their condition met
     local ready = {}
     for _, cand in ipairs(candidates) do
-        local def = state_defs[cand.name]
-        if def and check_progression_condition(cand.type, def, local_trend, current_values) then
-            table.insert(ready, {type = cand.type, name = cand.name, def = def})
+        local def = get_state_definition(season, cand.name)
+        if def then
+            local condition_met = check_progression_condition(
+                cand.type, current_state_def, cand.name, local_trend, current_values)
+            if condition_met then
+                table.insert(ready, {def = def, name = cand.name, path_type = cand.type})
+            end
         end
     end
 
     -- If exactly one candidate is ready, transition to it
     if #ready == 1 then
-        transition_state.cooldown = 3
+        transition_state.cooldown = 6
         transition_state.duration_timer = 0
-        return ready[1].def
-    end
+        return ready[1].name, ready[1].def
 
     -- If multiple candidates are ready, use weight as tiebreaker
-    if #ready > 1 then
-        local chosen = pick_among_ready(ready, state_defs)
-        transition_state.cooldown = 3
+    elseif #ready > 1 then
+        local chosen = pick_among_ready(ready)
+        transition_state.cooldown = 6
         transition_state.duration_timer = 0
-        return chosen
+        return chosen._name, chosen
     end
 
     -- No candidates ready — check duration expiry
-    transition_state.duration_timer = (transition_state.duration_timer or 0) + 1
-    if transition_state.duration_timer >= (transition_state.duration_target or 999) then
+    if duration_timer >= (transition_state.duration_target or 999) then
         -- Duration expired — prefer regression, then progression
         for _, cand in ipairs(candidates) do
             if cand.type == "regress" then
-                local def = state_defs[cand.name]
+                local def = get_state_definition(season, cand.name)
                 if def then
-                    transition_state.cooldown = 3
+                    transition_state.cooldown = 6
                     transition_state.duration_timer = 0
-                    return def
+                    return cand.name, def
                 end
             end
         end
         for _, cand in ipairs(candidates) do
             if cand.type == "progress" then
-                local def = state_defs[cand.name]
+                local def = get_state_definition(season, cand.name)
                 if def then
-                    transition_state.cooldown = 3
+                    transition_state.cooldown = 6
                     transition_state.duration_timer = 0
-                    return def
+                    return cand.name, def
                 end
             end
         end
@@ -889,25 +1006,25 @@ end
 
 ### Weight as tiebreaker
 
-If multiple progression paths have their conditions met simultaneously, `weight` breaks the tie:
+If multiple progression paths have their conditions met simultaneously, `weight` breaks the tie using weighted random selection:
 
 ```
-function pick_among_ready(ready_candidates, state_defs)
+function pick_among_ready(ready_candidates)
     local total_weight = 0
     for _, cand in ipairs(ready_candidates) do
-        total_weight = total_weight + (state_defs[cand.name].weight or 1)
+        total_weight = total_weight + (cand.def.weight or 1)
     end
 
     local roll = math.random() * total_weight
     local cumulative = 0
     for _, cand in ipairs(ready_candidates) do
-        cumulative = cumulative + (state_defs[cand.name].weight or 1)
+        cumulative = cumulative + (cand.def.weight or 1)
         if roll <= cumulative then
-            return state_defs[cand.name]
+            return cand.def
         end
     end
 
-    return state_defs[ready_candidates[1].name]
+    return ready_candidates[1].def
 end
 ```
 
@@ -922,82 +1039,86 @@ The time-windowed approach fixes both: the trend is computed over a fixed 5-minu
 
 ### Extracting target parameters
 
-When a transition is decided, the grid extracts the target parameters from the new state's notecard definition and sends them via TARGET_PUSH:
+When a transition is decided, the grid extracts the target parameters from the new state's notecard definition and sends them via TARGET_PUSH. This includes seasonal wind base values so Proc3 can configure its wind driver (Proc3 is in a different linkset and can't read the grid's `season:` config keys):
 
 ```
-function extract_targets(state_definition, season_config, ramp_seconds)
+function extract_targets_from_state(state_def, season)
+    local season_config = read_lsd("season:" .. season) or {}
+
     return {
-        temp_base = state_definition.temp_base,
-        temp_diurnal = state_definition.temp_diurnal,
-        temp_phase = state_definition.temp_phase,
-        humidity = state_definition.humidity,
-        pressure = state_definition.pressure,
-        wind_speed_mod = state_definition.wind_speed_mod or 0,
-        wind_dir_mod = state_definition.wind_dir_mod or 0,
-        wind_variability_mod = state_definition.wind_variability_mod or 0,
+        temp_base = state_def.temp_base,
+        temp_diurnal = state_def.temp_diurnal,
+        temp_phase = state_def.temp_phase,
+        humidity = state_def.humidity,
+        pressure = state_def.pressure,
+        wind_speed_mod = state_def.wind_speed_mod or 0,
+        wind_dir_mod = state_def.wind_dir_mod or 0,
+        wind_variability_mod = state_def.wind_variability_mod or 0,
+        -- Seasonal wind base values (so Proc3 can configure its wind driver)
         wind_base_speed = season_config.wind_base_speed,
         wind_base_dir = season_config.wind_base_dir,
-        wind_variability_base = season_config.wind_variability,
+        wind_variability = season_config.wind_variability,
+        -- Ramp duration for two-phase transition
         wind_ramp_seconds = ramp_seconds,
-        precipitation = state_definition.precipitation,
-        dust = state_definition.dust,
-        visibility = state_definition.visibility,
-        eep_preset = state_definition.eep_preset,
-        particle = state_definition.particle,
-        -- Flood modifiers included so processor can apply them
-        -- based on current flood state from drivers:flood_state
-        flood_peak_humidity = state_definition.flood_peak_humidity,
-        flood_receding_humidity = state_definition.flood_receding_humidity,
-        flood_low_dust = state_definition.flood_low_dust,
-        flood_rising_humidity = state_definition.flood_rising_humidity,
+        precipitation = state_def.precipitation,
+        dust = state_def.dust,
+        visibility = state_def.visibility,
+        eep_preset = state_def.eep_preset,
+        particle = state_def.particle,
+        -- Flood modifiers (applied by Proc2 based on current flood state)
+        flood_peak_humidity = state_def.flood_peak_humidity,
+        flood_receding_humidity = state_def.flood_receding_humidity,
+        flood_low_dust = state_def.flood_low_dust,
+        flood_rising_humidity = state_def.flood_rising_humidity,
     }
 end
 ```
 
-Note: flood modifiers are included in the target set so the processor knows what modifiers to apply for this state. The processor checks `drivers:flood_state` and applies the matching modifier. This keeps the flood logic in the processor (where the driver data lives) while keeping the modifier definitions in the grid (where the state definitions live).
-
-The wind fields use a split base/modifier design: `wind_base_speed`, `wind_base_dir`, and `wind_variability_base` come from the season configuration (the seasonal baseline), while `wind_speed_mod`, `wind_dir_mod`, and `wind_variability_mod` come from the state definition (the weather-state-specific adjustment). Proc3 combines the base and modifier to compute the actual wind (see [Wind speed model](#4-wind-speed-model-proc3)). `wind_ramp_seconds` controls the transition ramp duration for both Proc2's target interpolation and Proc3's wind modifier interpolation.
+The wind fields use a split base/modifier design: `wind_base_speed`, `wind_base_dir`, and `wind_variability` come from the season configuration (the seasonal baseline), while `wind_speed_mod`, `wind_dir_mod`, and `wind_variability_mod` come from the state definition (the weather-state-specific adjustment). Proc3 combines the base and modifier to compute the actual wind (see [Wind speed model](#4-wind-speed-model-proc3)). `wind_ramp_seconds` controls the transition ramp duration for both Proc2's target interpolation and Proc3's wind modifier interpolation.
 
 ### Initial state bootstrap
 
 On boot, the grid always starts in Clear Skies for the current season. It sends Clear Skies targets to the processor on registration. On the first poll, the grid evaluates whether the computed values strongly indicate a different state. If so, it jumps directly — bypassing normal progression.
 
 ```
-function bootstrap_evaluate(current_values, state_defs, season)
+function bootstrap_evaluate(current_values, season)
     -- Called once on first poll after boot
     -- Returns: state_def to jump to, or nil to stay in Clear Skies
 
     local pressure = current_values.pressure or 1013
-    local humidity = current_values.humidity or 50
     local pressure_trend = current_values.pressure_trend or 0
 
-    -- Strong indicators: pressure well below seasonal Clear Skies baseline
-    local clear_skies = state_defs[season .. ":Clear Skies"]
+    local clear_skies = get_state_definition(season, "Clear Skies")
     if not clear_skies then return nil end
 
     local baseline_pressure = clear_skies.pressure or 1013
     local delta = pressure - baseline_pressure
 
-    -- If pressure is >8 hPa below baseline, jump to the deepest matching state
+    -- If pressure is >8 hPa below baseline AND trend is rapidly falling → event state
     if delta < -8 and pressure_trend < -0.2 then
-        -- Rapid drop + very low pressure → event state (Khamsin/Storm)
-        for name, def in pairs(state_defs) do
-            if def.event and string.find(name, season) then
+        -- Find an event state in this season (Khamsin, Storm, Sirocco, etc.)
+        local event_names = {"Khamsin", "Storm"}
+        for _, name in ipairs(event_names) do
+            local def = get_state_definition(season, name)
+            if def and def.event then
                 return def
             end
         end
-    elseif delta < -5 then
-        -- Moderate drop → Cloudy or Rain
-        local cloudy = state_defs[season .. ":Cloudy"]
+    end
+
+    -- Moderate drop → Cloudy
+    if delta < -5 then
+        local cloudy = get_state_definition(season, "Cloudy")
         if cloudy then return cloudy end
-    elseif delta < -2 then
-        -- Slight drop → Partly Cloudy
-        local partly = state_defs[season .. ":Partly Cloudy"]
+    end
+
+    -- Slight drop → Partly Cloudy
+    if delta < -2 then
+        local partly = get_state_definition(season, "Partly Cloudy")
         if partly then return partly end
     end
 
-    -- No strong indicator — stay in Clear Skies
-    return nil
+    return nil  -- Stay in Clear Skies
 end
 ```
 
@@ -1035,8 +1156,10 @@ local chosen_duration = min_dur + math.random() * (max_dur - min_dur)
 Convert to cycles: at 15-second polls, 1 hour = 240 cycles.
 
 ```
-local duration_cycles = chosen_duration * 240
+local duration_cycles = math.floor(chosen_duration * 240)
 ```
+
+The duration is split into `duration_min` (the minimum hours, converted to cycles) and `duration_target` (the randomly chosen duration in cycles). The grid won't evaluate progression conditions until `duration_min` has passed, and will force a regression/progression when `duration_target` expires.
 
 ## 9. Summary of what runs where
 
@@ -1045,21 +1168,24 @@ local duration_cycles = chosen_duration * 240
 | Season determination | Grid | On boot, on season change |
 | Season blending | Grid | Every poll (in last 7 days of season) |
 | Bootstrap state evaluation | Grid | First poll only after boot |
-| Diurnal temperature | Proc2 | Every cycle (7.5s) |
-| State evolution (relaxation + noise) | Proc1 (macro), Proc2 (micro) | Every cycle (7.5s) |
+| Sun phase detection | Grid | Every poll (for time-gated transitions) |
+| Diurnal temperature (from sun direction) | Proc2 | Every cycle (7.5s) |
+| Maritime influence | Proc2 | Every cycle (reads wind from Proc3 driver) |
+| State evolution (relaxation + noise) | Proc2 (micro) | Every cycle (7.5s) |
 | Target interpolation (two-phase transition) | Proc2 | On TARGET_PUSH (ramps over wind_ramp_seconds) |
-| Wind direction interpolation | Proc2 | Every cycle (7.5s) |
-| Wind speed model (calm/gust, diurnal, gradient) | Proc3 | Every cycle (2.5s) |
-| Nile flood state | Proc3 | Once per day (or on boot) |
 | Flood modifier application | Proc2 | Every cycle (reads flood state from LSD) |
-| Background pressure driver | Proc3 | Every cycle (2.5s) |
-| Thermal & moisture pressure coupling | Proc3 | Every cycle (reads drivers:conditions) |
 | Pressure driver mixing | Proc2 | Every cycle (reads drivers:pressure, adds offset) |
-| Pressure trend exposure | Proc1 | Every cycle (reads drivers:pressure, writes to macro:evolution) |
+| Wind speed model (calm/gust, diurnal, gradient) | Proc3 | Every cycle (2.5s) |
+| Wind direction (sea breeze, noise, relaxation) | Proc3 | Every cycle (2.5s) |
+| Wind state modifier interpolation | Proc3 | On TARGET_PUSH (ramps over wind_ramp_seconds) |
+| Nile flood state | Proc3 | Once per day (or on boot) |
+| Background pressure driver (sinusoid, noise, dips) | Proc3 | Every cycle (2.5s) |
+| Thermal & moisture pressure coupling | Proc3 | Every cycle (reads drivers:conditions) |
+| Pressure trend exposure (pass-through) | Proc1 | Every cycle (reads drivers:pressure, writes to macro:evolution) |
 | Pressure history recording | Grid | Every poll (15s ±5s jitter) |
 | Time-windowed trend computation | Grid | Every poll (5-min linear regression over history) |
 | Driver trend cross-check | Grid | Every poll (compares local trend vs Proc3 trend) |
-| Progression condition check | Grid | Every poll (evaluates candidates against local trend) |
+| Progression condition check (data-driven) | Grid | Every poll (evaluates candidates against local trend + sun phase) |
 | Progression decision (condition + duration) | Grid | Every poll |
 | Weight tiebreaker (if multiple paths ready) | Grid | On simultaneous condition met |
 | Target parameter extraction | Grid | On progression decision |
