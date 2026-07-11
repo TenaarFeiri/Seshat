@@ -162,7 +162,7 @@ p = [grid_uuid, config, targets]
 |---|---|---|---|
 | 1 | grid_uuid | string | Object UUID of the grid prim |
 | 2 | config | object | Grid metadata: `{biome, climate, lat, eep_enabled, nile_adjacent, sea_direction, min_x, min_y, min_z, max_x, max_y, max_z}`. `sea_direction` is the cardinal direction of maritime influence (optional, omit for landlocked). The `min_*`/`max_*` fields define the grid's zone bounding box in region coordinates. |
-| 3 | targets | object | Initial target parameters (Clear Skies for current season): `{temp_base, temp_diurnal, temp_phase, humidity, pressure, wind_speed, wind_dir, wind_variability, precipitation, dust, visibility, eep_preset, particle, flood_*}` |
+| 3 | targets | object | Initial target parameters (Clear Skies for current season): `{temp_base, temp_diurnal, temp_phase, humidity, pressure, wind_speed_mod, wind_dir_mod, wind_variability_mod, wind_base_speed, wind_base_dir, wind_variability_base, wind_ramp_seconds, precipitation, dust, visibility, eep_preset, particle, flood_*}`. The `wind_speed_mod`, `wind_dir_mod`, `wind_variability_mod` fields are additive modifiers to the seasonal base values (`wind_base_speed`, `wind_base_dir`, `wind_variability_base`); Proc3 uses the base values to configure its wind driver and applies the modifiers for state-specific variation. `wind_ramp_seconds` (default 300) sets the ramp duration for two-phase transitions. The deprecated `wind_speed`, `wind_dir`, `wind_variability` fields are kept for backward compatibility but should not be used by new grids. |
 
 No method — this is the only REGISTER variant.
 
@@ -248,9 +248,11 @@ p = [grid_uuid, targets]
 | Position | Name | Type | Description |
 |---|---|---|---|
 | 1 | grid_uuid | string | Object UUID of the grid prim |
-| 2 | targets | object | New target parameters: `{temp_base, temp_diurnal, temp_phase, humidity, pressure, wind_speed, wind_dir, wind_variability, precipitation, dust, visibility, eep_preset, particle, flood_peak_humidity, flood_receding_humidity, flood_low_dust, flood_rising_humidity}` |
+| 2 | targets | object | New target parameters: `{temp_base, temp_diurnal, temp_phase, humidity, pressure, wind_speed_mod, wind_dir_mod, wind_variability_mod, wind_base_speed, wind_base_dir, wind_variability_base, wind_ramp_seconds, precipitation, dust, visibility, eep_preset, particle, flood_peak_humidity, flood_receding_humidity, flood_low_dust, flood_rising_humidity}`. The `wind_speed_mod`, `wind_dir_mod`, `wind_variability_mod` fields are additive modifiers to the seasonal base values (`wind_base_speed`, `wind_base_dir`, `wind_variability_base`); Proc3 reads these to configure its wind driver with the seasonal base and apply the state-specific modifiers. `wind_ramp_seconds` (default 300) sets the ramp duration for two-phase transitions. The deprecated `wind_speed`, `wind_dir`, `wind_variability` fields are kept for backward compatibility but should not be used by new grids. |
 
-Main writes `targets` to `<grid_uuid>:targets` in LSD. Proc1 and Proc2 pick up the new targets on their next round-robin pass — no explicit notification needed.
+Main writes `targets` to `<grid_uuid>:targets` in LSD. Proc1, Proc2, and Proc3 pick up the new targets on their next round-robin pass — no explicit notification needed. Proc3 reads the wind modifiers and seasonal base values to configure its wind driver.
+
+**Two-phase transitions:** When a grid decides a transition, it sends TARGET_PUSH immediately. This starts the wind ramp (Proc3 begins interpolating toward the new wind modifiers over `wind_ramp_seconds`) and target interpolation (Proc1/Proc2 begin evolving toward the new temp/humidity/pressure/etc. targets). However, the grid delays the EEP/particle switch for `wind_ramp_seconds` (default 300s) so that visual atmospheric conditions catch up to the new wind regime before the environment preset changes. This is the "two-phase transition" mechanism: phase 1 begins on TARGET_PUSH receipt (wind ramp + target interpolation), phase 2 begins after `wind_ramp_seconds` elapses (EEP/particle switch).
 
 ### Payload construction example
 
@@ -343,8 +345,10 @@ Shared by Main, Proc1, Proc2, Proc3. 128 KB total.
 ```
 grids                              → "uuid1,uuid2,uuid3" (CSV of registered grid UUIDs)
                                       Writer: Main
-                                      Readers: Proc1, Proc2 (round-robin workload list)
-                                      Proc3 does not read this.
+                                      Readers: Proc1, Proc2 (round-robin workload list),
+                                      Proc3 (reads grids registry and per-grid targets to
+                                      configure its wind driver with seasonal base values
+                                      and state-specific wind modifiers)
 
 drivers:flood_state                → {"state": "peak", "day_of_year": 258}
                                       Writer: Proc3
@@ -357,16 +361,40 @@ drivers:pressure                   → {"offset": -3.2, "trend": -0.15, "phase":
                                       Background atmospheric pressure variation — an independent external
                                       signal not tied to any grid's targets. Proc3 generates a slow
                                       sinusoidal pressure wave with stochastic noise, simulating passing
-                                      pressure systems. Proc2 adds the offset to its computed pressure;
-                                      Proc1 includes the trend in macro:evolution so the grid can evaluate
-                                      it for progression decisions. This gives the grid an independent
-                                      signal to evaluate, preventing the circular dependency where the
-                                      grid only sees reflections of its own target decisions.
+                                      pressure systems. Proc3 also incorporates thermal/moisture coupling
+                                      from `drivers:conditions` (temperature and humidity influence on
+                                      pressure), so the pressure driver responds to environmental
+                                      conditions rather than operating in isolation. Proc2 adds the
+                                      offset to its computed pressure; Proc1 includes the trend in
+                                      macro:evolution so the grid can evaluate it for progression
+                                      decisions. This gives the grid an independent signal to evaluate,
+                                      preventing the circular dependency where the grid only sees
+                                      reflections of its own target decisions.
 
 drivers:extreme_weather            → {"active": false, "type": null, ...}
                                       Writer: Proc3
                                       Readers: Proc1, Proc2
                                       Reserved for future extreme weather overrides. Not implemented in v1.
+
+drivers:wind                       → {"speed": 14.5, "direction": 338.2, "speed_target": 15.0,
+                                      "dir_target": 337.5, "ramp_progress": 1.0, ...internal_state}
+                                      Writer: Proc3
+                                      Readers: Proc2 (uses speed/direction directly instead of relaxing
+                                      toward notecard wind targets)
+                                      Global wind driver — Proc3 simulates wind speed and direction
+                                      independently with calm/gust oscillation cycles, direction wandering,
+                                      and state modifier interpolation. Proc2 reads this driver and applies
+                                      the wind values directly, then computes maritime influence from the
+                                      wind direction. Internal state (phase, mods, ramp) is persisted for
+                                      reset recovery.
+
+drivers:conditions                 → {"temp": 26.0, "humidity": 68.5, "pressure": 1009.0,
+                                      "wind_speed": 14.5, "wind_dir": 338.2}
+                                      Writer: Proc2
+                                      Readers: Proc3 (used for pressure-wind coupling in Phase 3)
+                                      Aggregated environmental conditions from the most recently processed
+                                      grid. Proc3 reads this to compute temperature/humidity influence on
+                                      pressure and wind (the feedback loop).
 
 reset_mode                         → "soft" | "full" | (absent)
                                       Writer: Main (during reset pipeline)
@@ -387,14 +415,19 @@ reset_mode                         → "soft" | "full" | (absent)
                                       Grid metadata including zone bounding box. Populated on-demand if missing.
 
 <grid_uuid>:targets                → {"temp_base": 24, "temp_diurnal": 8, "temp_phase": 14,
-                                      "humidity": 35, "pressure": 1015, "wind_speed": 5,
-                                      "wind_dir": "NW", "wind_variability": 0.3,
+                                      "humidity": 35, "pressure": 1015,
+                                      "wind_speed_mod": 0, "wind_dir_mod": 0,
+                                      "wind_variability_mod": 0,
+                                      "wind_base_speed": 5, "wind_base_dir": "NW",
+                                      "wind_variability_base": 0.3,
+                                      "wind_ramp_seconds": 300,
                                       "precipitation": 0, "dust": 0, "visibility": 50,
                                       "eep_preset": "Clear_Spring_Day", "particle": "none",
                                       "flood_peak_humidity": 15, "flood_receding_humidity": 8,
                                       "flood_low_dust": 10, "flood_rising_humidity": 5}
                                       Writer: Main (on behalf of grid, via TARGET_PUSH)
-                                      Readers: Proc1, Proc2
+                                      Readers: Proc1, Proc2, Proc3 (Proc3 reads wind modifiers
+                                      and seasonal base values to configure its wind driver)
                                       Current target parameters the processor evolves toward.
                                       Set on registration (initial state) and updated on each
                                       state transition decided by the grid. The processor does
@@ -466,10 +499,13 @@ reset_mode                         → "soft" | "full" | (absent)
 
 | Key prefix | Writer | Readers |
 |---|---|---|
-| `grids` | Main | Proc1, Proc2 |
-| `drivers:*` | Proc3 | Proc1, Proc2 |
+| `grids` | Main | Proc1, Proc2, Proc3 |
+| `drivers:wind` | Proc3 | Proc1, Proc2, Grid (via STATE_RESP) |
+| `drivers:conditions` | Proc2 | Proc3 (temp/humidity for pressure-wind coupling) |
+| `drivers:pressure` | Proc3 | Proc2, Proc1 (includes thermal/moisture coupling from conditions data) |
+| `drivers:*` (other) | Proc3 | Proc1, Proc2 |
 | `<grid_uuid>:meta` | Main | Proc1, Proc2, Proc3 |
-| `<grid_uuid>:targets` | Main (on behalf of grid via TARGET_PUSH) | Proc1, Proc2 |
+| `<grid_uuid>:targets` | Main (on behalf of grid via TARGET_PUSH) | Proc1, Proc2, Proc3 |
 | `<grid_uuid>:macro:*` | Proc1 | Proc2, grid |
 | `<grid_uuid>:micro:*` | Proc2 | Proc1, grid |
 | `reset_mode` | Main | Main (self, on reboot) |
@@ -499,9 +535,32 @@ config                             → {"biome": "desert_coast", "climate": "med
                                       The min_*/max_* fields define the grid's zone bounding box
                                       in region coordinates. min_z/max_z are the altitude band.
 
+season:Shemu                       → {"wind_base_speed": 8, "wind_base_dir": "N",
+                                      "wind_variability": 0.4}
+                                      Writer: notecard loader (once, on first boot)
+                                      Readers: grid controller
+                                      Season-level wind configuration. Contains the seasonal
+                                      prevailing wind base speed, cardinal direction, and
+                                      variability base. The grid controller reads these to
+                                      populate wind_base_speed, wind_base_dir, and
+                                      wind_variability_base in TARGET_PUSH payloads so Proc3
+                                      can configure its wind driver. One key per defined season
+                                      (e.g. season:Shemu, season:Akhet, season:Peret).
+
+season:Akhet                       → {"wind_base_speed": 15, "wind_base_dir": "NW",
+                                      "wind_variability": 0.3}
+                                      Writer: notecard loader (once)
+                                      Readers: grid controller
+
+season:Peret                       → {"wind_base_speed": 12, "wind_base_dir": "N",
+                                      "wind_variability": 0.35}
+                                      Writer: notecard loader (once)
+                                      Readers: grid controller
+
 Akhet:Clear Skies                  → {"temp_base": 24, "temp_diurnal": 4, "temp_phase": 14,
-                                      "humidity": 67, "pressure": 1015, "wind_speed": 15,
-                                      "wind_dir": "NW", "wind_variability": 0.3,
+                                      "humidity": 67, "pressure": 1015,
+                                      "wind_speed_mod": 0, "wind_dir_mod": 0,
+                                      "wind_variability_mod": 0,
                                       "precipitation": 5, "dust": 0, "visibility": 50,
                                       "weight": 8, "duration": "5-10",
                                       "eep_preset": "Clear_Akhet_Day", "particle": "none",
@@ -564,7 +623,7 @@ transition                         → {"current": "Clear Skies", "season": "Akh
 
 **Notes:**
 
-- The `config` and `season:weather_state` keys are written once by the notecard streaming loader and never modified at runtime. They are the grid's authored parameters and the source of target values for TARGET_PUSH. Each weather state includes `progresses_to`, `regresses_to`, and optionally `diverges_to` fields defining the progression graph.
+- The `config`, `season:<name>`, and `season:weather_state` keys are written once by the notecard streaming loader and never modified at runtime. They are the grid's authored parameters and the source of target values for TARGET_PUSH. Each weather state includes `progresses_to`, `regresses_to`, and optionally `diverges_to` fields defining the progression graph. The `season:<name>` keys hold season-level wind base configuration (`wind_base_speed`, `wind_base_dir`, `wind_variability`) that the grid controller reads to populate the `wind_base_speed`, `wind_base_dir`, and `wind_variability_base` fields in TARGET_PUSH payloads.
 - The `state` key is the grid's live runtime state, updated from processor responses. It's a flat object rather than per-field keys because the grid reads it as a whole for presentation and progression evaluation.
 - The `transition` key is the grid's progression decision workspace. It holds a timestamped pressure history that the grid uses to compute time-windowed trends (5-minute linear regression). Progression conditions are evaluated against these real-time trends, not poll counts — making the system immune to poll cadence and processor cycle timing. The grid also receives Proc3's driver pressure trend via `macro:evolution.pressure_trend` in each STATE_RESP and can cross-check it against its local trend. When a condition is met, the grid transitions along the corresponding path and sends new targets via TARGET_PUSH.
 - Weather state keys use `season:state_name` format. Season names may be compound (`Spring/Akhet`) using `/` as the taxonomy separator. State names and season names cannot contain `:` (the namespace delimiter). Spaces in state names are allowed.
