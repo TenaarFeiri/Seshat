@@ -95,11 +95,16 @@ Each state block defines a single weather state for the current season. State na
 
 ### Wind modifiers
 
+These modifiers are applied **per grid** on top of the region-global base wind
+computed by Proc3, so two grids in different states experience different wind
+from the same base driver. They ramp smoothly during state transitions via
+Proc2's target interpolation over `wind_ramp_seconds`.
+
 | Field | Type | Required | Description |
 |---|---|---|---|
 | `wind_speed_mod` | number | yes | Additive modifier to seasonal `wind_base_speed` (kph) |
 | `wind_dir_mod` | number | yes | Direction shift in degrees applied to seasonal `wind_base_dir` |
-| `wind_variability_mod` | number | yes | Additive modifier to seasonal `wind_variability` |
+| `wind_variability_mod` | number | yes | Additive modifier to seasonal `wind_variability`; controls the grid's extra direction wander relative to the base wind |
 
 ### Presentation
 

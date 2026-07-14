@@ -56,13 +56,17 @@ local LSD_KEY_DRIVERS_PRESSURE = "drivers:pressure"
 local LSD_KEY_DRIVERS_WIND = "drivers:wind"
 local LSD_KEY_DRIVERS_CONDITIONS = "drivers:conditions"
 
--- Target interpolation state (for smooth state transitions)
--- When targets change, Proc2 interpolates from old to new over the ramp period
-local interp_old_targets: any = nil       -- Previous targets (before change)
-local interp_new_targets: any = nil       -- New targets (what we're ramping to)
-local interp_ramp_remaining: number = 0   -- Cycles remaining in interpolation
-local interp_ramp_total: number = 0       -- Total ramp cycles
-local interp_last_target_signature: string = ""  -- Detects target changes
+-- Target interpolation state (for smooth state transitions), kept PER GRID.
+-- When a grid's targets change, Proc2 interpolates from old to new over the
+-- ramp period. Keyed by grid UUID so multiple grids never share ramp state.
+type InterpState = {
+    old_targets: any,        -- Previous targets (before change)
+    new_targets: any,        -- New targets (what we're ramping to)
+    ramp_remaining: number,  -- Cycles remaining in interpolation
+    ramp_total: number,      -- Total ramp cycles
+    last_signature: string,  -- Detects target changes
+}
+local interp_states: { [string]: InterpState } = {}
 
 -- Relaxation model parameters (from SIMULATION_MATHS.md section 2)
 local RELAXATION_RATE = 0.05       -- How fast values drift toward targets (0-1 per cycle)
@@ -155,8 +159,17 @@ end
 -- new_value = current + (target - current) * rate + noise
 local function relax_value(current_value: number, target_value: number, rate: number, noise_scale: number): number
     local delta: number = (target_value - current_value) * rate
-    local noise: number = (math.random() - 0.5) * 2 * noise_scale * math.abs(target_value - current_value + 1)
+    -- Noise is proportional to the remaining distance, with a floor of 1 so
+    -- values still breathe a little once settled on target.
+    local noise: number = (math.random() - 0.5) * 2 * noise_scale * (math.abs(target_value - current_value) + 1)
     return current_value + delta + noise
+end
+
+-- Clamp a value into [min_value, max_value].
+local function clamp(value: number, min_value: number, max_value: number): number
+    if value < min_value then return min_value end
+    if value > max_value then return max_value end
+    return value
 end
 
 --================================================//
@@ -299,28 +312,35 @@ local function evolve_grid_micro(grid_uuid: string): ()
     local raw_targets: any = lsd_read_json(grid_uuid .. ":targets") or {}
     local meta: any = lsd_read_json(grid_uuid .. ":meta") or {}
 
-    -- Detect target changes and start interpolation ramp
+    -- Detect target changes and start interpolation ramp (per-grid state)
     -- Create a signature from key target fields to detect changes
+    local interp: InterpState = interp_states[grid_uuid]
+    if not interp then
+        interp = {old_targets = nil, new_targets = nil, ramp_remaining = 0, ramp_total = 0, last_signature = ""}
+        interp_states[grid_uuid] = interp
+    end
     local target_sig: string = tostring(raw_targets.temp_base) .. ":" .. tostring(raw_targets.humidity)
         .. ":" .. tostring(raw_targets.pressure) .. ":" .. tostring(raw_targets.dust)
         .. ":" .. tostring(raw_targets.visibility) .. ":" .. tostring(raw_targets.wind_speed_mod)
         .. ":" .. tostring(raw_targets.wind_dir_mod)
-    if target_sig ~= interp_last_target_signature and interp_last_target_signature ~= "" then
+    if target_sig ~= interp.last_signature and interp.last_signature ~= "" then
         -- Targets changed — start interpolation
-        interp_old_targets = interp_new_targets or raw_targets
-        interp_new_targets = raw_targets
+        interp.old_targets = interp.new_targets or raw_targets
+        interp.new_targets = raw_targets
         local ramp_seconds: number = raw_targets.wind_ramp_seconds or 300
-        local ramp_cycles: number = math.floor(ramp_seconds / COMPUTE_INTERVAL_SECONDS)
+        -- Each grid is visited once per full round-robin pass
+        local grid_count: number = math.max(1, #get_registered_grids())
+        local ramp_cycles: number = math.floor(ramp_seconds / (COMPUTE_INTERVAL_SECONDS * grid_count))
         if ramp_cycles < 2 then ramp_cycles = 2 end
-        interp_ramp_remaining = ramp_cycles
-        interp_ramp_total = ramp_cycles
+        interp.ramp_remaining = ramp_cycles
+        interp.ramp_total = ramp_cycles
     end
-    interp_last_target_signature = target_sig
+    interp.last_signature = target_sig
 
     -- Compute effective targets (interpolated during ramp, otherwise raw)
     local targets: any = raw_targets
-    if interp_ramp_remaining > 0 and interp_old_targets and interp_new_targets then
-        local progress: number = 1.0 - (interp_ramp_remaining / interp_ramp_total)
+    if interp.ramp_remaining > 0 and interp.old_targets and interp.new_targets then
+        local progress: number = 1.0 - (interp.ramp_remaining / interp.ramp_total)
         local function lerp(old: any, new: any): number
             local o: number = tonumber(old) or 0
             local n: number = tonumber(new) or 0
@@ -328,13 +348,13 @@ local function evolve_grid_micro(grid_uuid: string): ()
         end
         targets = {}
         for k, v in pairs(raw_targets) do
-            if type(v) == "number" and interp_old_targets[k] ~= nil then
-                targets[k] = lerp(interp_old_targets[k], v)
+            if type(v) == "number" and interp.old_targets[k] ~= nil then
+                targets[k] = lerp(interp.old_targets[k], v)
             else
                 targets[k] = v
             end
         end
-        interp_ramp_remaining = interp_ramp_remaining - 1
+        interp.ramp_remaining = interp.ramp_remaining - 1
     end
 
     -- Read current micro values (or initialize from targets if first cycle)
@@ -353,19 +373,27 @@ local function evolve_grid_micro(grid_uuid: string): ()
     local flood_state: string = get_current_flood_state()
     local nile_adjacent: boolean = meta.nile_adjacent or false
 
-    -- Read variability from targets for noise scaling (used for non-wind values)
-    local wind_variability: number = targets.wind_variability or 0.3
-
-    -- ===== Wind (from Proc3 driver, not relaxed locally) =====
-    -- Proc3 computes wind speed and direction as a global environmental driver.
-    -- Proc2 reads the driver and uses it directly. Maritime influence is still
-    -- applied here since it depends on the grid's sea_direction (which is per-grid).
+    -- ===== Wind (global driver + per-grid state modifiers) =====
+    -- Proc3 computes the region-global BASE wind (calm/gust oscillation,
+    -- diurnal breeze, pressure-gradient coupling). Per-grid character comes
+    -- from the current state's wind_speed_mod / wind_dir_mod /
+    -- wind_variability_mod, which ramp smoothly through the target
+    -- interpolation above — so grids in different weather states each get
+    -- their own wind on top of the shared base.
     local wind_driver: any = lsd_read_json(LSD_KEY_DRIVERS_WIND)
     local computed_wind_dir: number
     local computed_wind_speed: number
     if wind_driver then
-        computed_wind_dir = wind_driver.direction or 0
-        computed_wind_speed = wind_driver.speed or 0
+        local speed_mod: number = targets.wind_speed_mod or 0
+        local dir_mod: number = targets.wind_dir_mod or 0
+        computed_wind_speed = math.max(0.5, (wind_driver.speed or 0) + speed_mod)
+        -- Per-grid direction: relax the persisted value toward the driver
+        -- direction + state modifier. The state's variability modifier adds
+        -- extra wander (e.g. Khamsin swirls while Clear Skies tracks calmly).
+        local dir_target: number = ((wind_driver.direction or 0) + dir_mod) % 360
+        local extra_variability: number = math.max(0, targets.wind_variability_mod or 0)
+        local current_dir: number = micro_wind_dir.current or dir_target
+        computed_wind_dir = relax_wind_direction(current_dir, dir_target, 0.3, extra_variability)
     else
         -- Fallback: use targets if driver not yet available (cold boot)
         computed_wind_dir = cardinal_to_degrees(targets.wind_dir or "N")
@@ -400,13 +428,9 @@ local function evolve_grid_micro(grid_uuid: string): ()
     -- Maritime humidity: add maritime * modifier to the target (positive maritime = from sea = more humid)
     target_humidity = target_humidity + maritime * sea_humidity_modifier
     target_humidity = apply_flood_modifier("humidity", target_humidity, targets, flood_state, nile_adjacent)
-    -- Clamp target to valid range
-    if target_humidity < 0 then target_humidity = 0 end
-    if target_humidity > 100 then target_humidity = 100 end
-    local computed_humidity: number = relax_value(current_humidity, target_humidity, RELAXATION_RATE, NOISE_SCALE_DEFAULT)
-    -- Clamp computed to valid range
-    if computed_humidity < 0 then computed_humidity = 0 end
-    if computed_humidity > 100 then computed_humidity = 100 end
+    target_humidity = clamp(target_humidity, 0, 100)
+    local computed_humidity: number = clamp(
+        relax_value(current_humidity, target_humidity, RELAXATION_RATE, NOISE_SCALE_DEFAULT), 0, 100)
 
     -- ===== Pressure (relaxed toward target + background driver offset) =====
     -- The driver offset is NOT stored in micro:pressure — only the base
@@ -424,18 +448,21 @@ local function evolve_grid_micro(grid_uuid: string): ()
     -- ===== Precipitation (relaxed toward target) =====
     local current_precipitation: number = micro_precipitation.current or targets.precipitation or 0
     local target_precipitation: number = targets.precipitation or 0
-    local computed_precipitation: number = relax_value(current_precipitation, target_precipitation, RELAXATION_RATE, NOISE_SCALE_DEFAULT)
+    local computed_precipitation: number = math.max(0,
+        relax_value(current_precipitation, target_precipitation, RELAXATION_RATE, NOISE_SCALE_DEFAULT))
 
     -- ===== Dust (relaxed toward target, flood-modified) =====
     local current_dust: number = micro_dust.current or targets.dust or 0
     local target_dust: number = targets.dust or 0
     target_dust = apply_flood_modifier("dust", target_dust, targets, flood_state, nile_adjacent)
-    local computed_dust: number = relax_value(current_dust, target_dust, RELAXATION_RATE, NOISE_SCALE_DEFAULT)
+    local computed_dust: number = math.max(0,
+        relax_value(current_dust, target_dust, RELAXATION_RATE, NOISE_SCALE_DEFAULT))
 
     -- ===== Visibility (relaxed toward target) =====
     local current_visibility: number = micro_visibility.current or targets.visibility or 50
     local target_visibility: number = targets.visibility or 50
-    local computed_visibility: number = relax_value(current_visibility, target_visibility, RELAXATION_RATE, NOISE_SCALE_DEFAULT)
+    local computed_visibility: number = math.max(0,
+        relax_value(current_visibility, target_visibility, RELAXATION_RATE, NOISE_SCALE_DEFAULT))
 
     -- ===== EEP and particle (pass-through from targets, no evolution) =====
     local eep_preset: string = targets.eep_preset or "none"

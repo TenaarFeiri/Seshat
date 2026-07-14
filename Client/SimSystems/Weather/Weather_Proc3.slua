@@ -70,18 +70,36 @@ local FLOOD_PEAK_START_DAY = 213     -- Aug 1
 local FLOOD_PEAK_END_DAY = 304       -- Oct 31
 -- Receding is everything else (Nov 1 – Feb 28/29)
 
--- Pressure driver parameters (from SIMULATION_MATHS.md section 5)
-local PRESSURE_AMPLITUDE_HPA = 5         -- Base sinusoidal amplitude (±5 hPa)
-local PRESSURE_NOISE_RANGE_HPA = 2       -- Stochastic noise range (±1 hPa each side)
-local PRESSURE_PERIOD_CYCLES = 480       -- Cycles per full sinusoidal wave (480 * 2.5s = 20 min)
-local PRESSURE_HISTORY_MAX_ENTRIES = 10  -- Rolling window for trend computation (10 * 2.5s = 25s window)
-local PRESSURE_SEED_DIVISOR = 1200       -- Divides os.time() for cold-boot phase seed (1200s = 20min = one full cycle)
+-- Pressure driver parameters (see SIMULATION_MATHS.md section 5).
+-- The driver layers three signals on top of the state-target pressure:
+--   1. Synoptic systems — rare, coherent lows/highs that approach, hold, and
+--      depart over 1-3 hours. These create the genuine weather arcs with
+--      sustained pressure trends the grids' state machines respond to.
+--   2. A mesoscale wave — gentle background swell (±1.5 hPa over ~1 hour)
+--      that keeps everyday pressure alive between systems.
+--   3. White noise — small per-cycle jitter.
+local MESO_AMPLITUDE_HPA = 1.5           -- Mesoscale wave amplitude
+local MESO_PERIOD_SECONDS = 3600         -- Mesoscale wave period (1 hour)
+local PRESSURE_NOISE_RANGE_HPA = 0.6     -- White noise range (±0.3 hPa)
 
--- Cyclone dip parameters
-local CYCLONE_DIP_CHANCE_PER_CYCLE = 0.05  -- 5% chance per cycle to start a dip
-local CYCLONE_DIP_MIN_MAGNITUDE_HPA = -8   -- Minimum dip magnitude
-local CYCLONE_DIP_MAX_MAGNITUDE_HPA = -15  -- Maximum dip magnitude
-local CYCLONE_DIP_DURATION_CYCLES = 40     -- How many cycles a dip lasts (40 * 2.5s = 100s)
+-- Synoptic system parameters
+local SYSTEM_MEAN_INTERVAL_SECONDS = 7200   -- Average idle time before a new system spawns (~2 h)
+local SYSTEM_REFRACTORY_SECONDS = 1800      -- Minimum quiet gap after a system ends (30 min)
+local SYSTEM_LOW_PROBABILITY = 0.6          -- Chance a new system is a low (vs a high)
+local SYSTEM_LOW_MIN_HPA = -18              -- Low depth range (negative offsets)
+local SYSTEM_LOW_MAX_HPA = -6
+local SYSTEM_HIGH_MIN_HPA = 4               -- High strength range (positive offsets)
+local SYSTEM_HIGH_MAX_HPA = 10
+local SYSTEM_RAMP_MIN_SECONDS = 1200        -- Approach/departure duration: 20-50 min
+local SYSTEM_RAMP_MAX_SECONDS = 3000
+local SYSTEM_HOLD_MIN_SECONDS = 600         -- Time at full strength: 10-40 min
+local SYSTEM_HOLD_MAX_SECONDS = 2400
+
+-- Trend computation: linear regression over timestamped offset samples.
+-- Reported in hPa/min — the same unit the grids use for their local trend
+-- and the notecard uses for all *_trend_* thresholds.
+local PRESSURE_TREND_WINDOW_SECONDS = 300   -- 5-minute window (matches the grid's)
+local PRESSURE_TREND_SAMPLE_SECONDS = 10    -- Minimum spacing between samples
 
 -- Wind driver parameters (from WIND_DRIVER_DESIGN.md)
 local WIND_OSCILLATION_PERIOD_CYCLES = 480  -- Cycles per full calm/gust wave (480 * 2.5s = 20 min)
@@ -96,12 +114,17 @@ local WIND_DIURNAL_DIR_SHIFT = 30           -- Direction shift (degrees) at peak
 local TWO_PI = 2 * math.pi
 
 -- Pressure-wind coupling parameters (from WIND_DRIVER_DESIGN.md)
-local TEMP_PRESSURE_FACTOR = 0.3       -- hPa per °C deviation from seasonal avg
-local HUMIDITY_PRESSURE_FACTOR = 0.05  -- hPa per % deviation from seasonal avg
-local GRADIENT_WIND_FACTOR = 50        -- kph per hPa/min of pressure trend
--- Seasonal averages (updated from conditions data, used as baseline for coupling)
-local seasonal_temp_avg: number = 25   -- Updated from grid targets
-local seasonal_humidity_avg: number = 70
+-- Thermal/moisture coupling works on ANOMALIES: a fast EMA of current
+-- conditions is compared against a slow EMA baseline, so pressure responds
+-- to unusually hot/humid spells rather than to the absolute state targets.
+local TEMP_PRESSURE_FACTOR = 0.3       -- hPa per °C of temperature anomaly
+local HUMIDITY_PRESSURE_FACTOR = 0.05  -- hPa per % of humidity anomaly
+local COUPLING_FAST_EMA_RATE = 0.02    -- Fast EMA: τ ≈ 2 min at 2.5 s cycles
+local COUPLING_SLOW_EMA_RATE = 0.0005  -- Slow baseline EMA: τ ≈ 80 min
+local COUPLING_TEMP_CAP_HPA = 2.0      -- Max thermal contribution (either sign)
+local COUPLING_HUMIDITY_CAP_HPA = 1.5  -- Max moisture contribution (either sign)
+local GRADIENT_WIND_FACTOR = 25        -- kph per hPa/min of pressure trend
+local GRADIENT_WIND_MAX_KPH = 25       -- Cap on the gradient wind contribution
 
 -- Months (for day-of-year computation)
 local DAYS_IN_MONTH_NON_LEAP: {number} = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31}
@@ -115,25 +138,22 @@ local LEAP_YEAR_DIVISOR_400 = 400
 --================== State ==================--
 
 -- Pressure driver internal state (persisted in drivers:pressure between cycles)
-local pressure_phase: number = 0           -- Current phase of the sinusoidal wave (radians)
-local pressure_offset_history: {number} = {}  -- Rolling window of recent offsets for trend computation
-local cyclone_dip_active: boolean = false   -- Whether a cyclone dip is currently in progress
-local cyclone_dip_magnitude: number = 0     -- Current dip magnitude (negative hPa)
-local cyclone_dip_timer: number = 0         -- Cycles remaining in the current dip
+local meso_phase: number = 0                -- Mesoscale wave phase (radians)
+local pressure_samples: {{t: number, v: number}} = {}  -- Timestamped offsets for trend regression
+local active_system: any = nil              -- Current synoptic system, or nil when quiet
+local system_refractory_until: number = 0   -- No new system spawns before this unix time
+-- Thermal/moisture coupling EMAs (nil until first conditions data arrives)
+local coupling_temp_fast: number? = nil
+local coupling_temp_slow: number? = nil
+local coupling_humidity_fast: number? = nil
+local coupling_humidity_slow: number? = nil
 
 -- Wind driver internal state (persisted in drivers:wind between cycles)
+-- NOTE: per-state wind modifiers (wind_speed_mod etc.) are now applied
+-- PER GRID by Proc2 — this driver only computes the region-global base wind.
 local wind_phase: number = 0                -- Current phase of the calm/gust oscillation (radians)
 local wind_current_speed: number = 0        -- Current computed wind speed (kph)
 local wind_current_dir: number = 0          -- Current computed wind direction (degrees)
--- State modifiers (interpolated when grid pushes new targets)
-local wind_speed_mod: number = 0            -- Current effective speed modifier (kph)
-local wind_dir_mod: number = 0              -- Current effective direction modifier (degrees)
-local wind_variability_mod: number = 0      -- Current effective variability modifier
-local wind_target_speed_mod: number = 0     -- Target speed modifier (from grid)
-local wind_target_dir_mod: number = 0       -- Target direction modifier (from grid)
-local wind_target_var_mod: number = 0       -- Target variability modifier (from grid)
-local wind_ramp_remaining: number = 0       -- Cycles remaining in modifier ramp (0 = settled)
-local wind_ramp_total: number = 0           -- Total ramp cycles (for progress calculation)
 local wind_base_speed: number = 15          -- Seasonal base wind speed (from conditions/config)
 local wind_base_dir: number = 337.5         -- Seasonal base wind direction (degrees, from config)
 local wind_variability: number = 0.3        -- Seasonal base variability (from config)
@@ -282,24 +302,55 @@ end
 
 --======== Background Pressure Driver =========--
 
--- Compute the linear regression slope over a history of offset values.
--- Returns the trend in hPa per cycle.
-local function compute_pressure_trend(history: {number}): number
-    local entry_count: number = #history
+-- Random value in [min_value, max_value].
+local function random_range(min_value: number, max_value: number): number
+    return min_value + math.random() * (max_value - min_value)
+end
+
+-- Clamp a value into [-cap, cap].
+local function clamp_symmetric(value: number, cap: number): number
+    if value > cap then return cap end
+    if value < -cap then return -cap end
+    return value
+end
+
+-- Record a timestamped offset sample and prune outside the trend window.
+-- Samples are spaced at least PRESSURE_TREND_SAMPLE_SECONDS apart to keep
+-- the persisted history compact (~30 entries for a 5-minute window).
+local function record_pressure_sample(offset: number): ()
+    local now: number = os.time()
+    local sample_count: number = #pressure_samples
+    if sample_count == 0 or (now - pressure_samples[sample_count].t) >= PRESSURE_TREND_SAMPLE_SECONDS then
+        table.insert(pressure_samples, {t = now, v = offset})
+    end
+    local cutoff: number = now - PRESSURE_TREND_WINDOW_SECONDS
+    while #pressure_samples > 0 and pressure_samples[1].t < cutoff do
+        table.remove(pressure_samples, 1)
+    end
+end
+
+-- Linear regression over the timestamped samples. Returns hPa per MINUTE
+-- (the unit used by the grids and all notecard trend thresholds).
+-- Timestamps are offset from the first sample before squaring — raw unix
+-- times (~1.7e9) squared lose enough float precision to corrupt the slope.
+local function compute_pressure_trend(): number
+    local entry_count: number = #pressure_samples
     if entry_count < 2 then
         return 0
     end
 
+    local base_time: number = pressure_samples[1].t
     local sum_x: number = 0
     local sum_y: number = 0
     local sum_xy: number = 0
     local sum_x_squared: number = 0
 
-    for i = 1, entry_count do
-        sum_x = sum_x + i
-        sum_y = sum_y + history[i]
-        sum_xy = sum_xy + i * history[i]
-        sum_x_squared = sum_x_squared + i * i
+    for _, sample in ipairs(pressure_samples) do
+        local x: number = sample.t - base_time
+        sum_x = sum_x + x
+        sum_y = sum_y + sample.v
+        sum_xy = sum_xy + x * sample.v
+        sum_x_squared = sum_x_squared + x * x
     end
 
     local denominator: number = entry_count * sum_x_squared - sum_x * sum_x
@@ -308,70 +359,131 @@ local function compute_pressure_trend(history: {number}): number
     end
 
     local slope: number = (entry_count * sum_xy - sum_x * sum_y) / denominator
-    return slope
+    return slope * 60  -- hPa/sec → hPa/min
 end
 
--- Compute one cycle of the background pressure driver.
--- Returns the offset (hPa), trend (hPa/cycle), and phase for this cycle.
--- Incorporates temperature and humidity influences (thermal/moisture coupling)
--- from the conditions data written by Proc2.
-local function compute_pressure_driver_cycle(): {offset: number, trend: number, phase: number}
-    -- Advance the sinusoidal phase
-    local phase_increment: number = (2 * math.pi) / PRESSURE_PERIOD_CYCLES
-    pressure_phase = pressure_phase + phase_increment
-
-    -- Base sinusoidal offset
-    local base_offset: number = PRESSURE_AMPLITUDE_HPA * math.sin(pressure_phase)
-
-    -- Stochastic noise (±1 hPa)
-    local noise: number = (math.random() - 0.5) * PRESSURE_NOISE_RANGE_HPA
-
-    -- Cyclone dip: occasionally inject a deeper pressure dip
-    local dip_offset: number = 0
-    if not cyclone_dip_active and math.random() < CYCLONE_DIP_CHANCE_PER_CYCLE then
-        cyclone_dip_active = true
-        local magnitude_range: number = CYCLONE_DIP_MAX_MAGNITUDE_HPA - CYCLONE_DIP_MIN_MAGNITUDE_HPA
-        cyclone_dip_magnitude = CYCLONE_DIP_MIN_MAGNITUDE_HPA + math.random() * magnitude_range
-        cyclone_dip_timer = CYCLONE_DIP_DURATION_CYCLES
+-- Spawn a new synoptic system (low or high) with randomized depth and timing.
+local function spawn_synoptic_system(): ()
+    local is_low: boolean = math.random() < SYSTEM_LOW_PROBABILITY
+    local magnitude: number
+    if is_low then
+        magnitude = random_range(SYSTEM_LOW_MIN_HPA, SYSTEM_LOW_MAX_HPA)
+    else
+        magnitude = random_range(SYSTEM_HIGH_MIN_HPA, SYSTEM_HIGH_MAX_HPA)
     end
+    active_system = {
+        kind = is_low and "low" or "high",
+        magnitude = magnitude,
+        elapsed = 0,
+        ramp_in = random_range(SYSTEM_RAMP_MIN_SECONDS, SYSTEM_RAMP_MAX_SECONDS),
+        hold = random_range(SYSTEM_HOLD_MIN_SECONDS, SYSTEM_HOLD_MAX_SECONDS),
+        ramp_out = random_range(SYSTEM_RAMP_MIN_SECONDS, SYSTEM_RAMP_MAX_SECONDS),
+    }
+    ll.OwnerSay("[" .. SCRIPT_ID .. "] Synoptic " .. active_system.kind .. " forming: "
+        .. string.format("%.1f", magnitude) .. " hPa over "
+        .. string.format("%.0f", (active_system.ramp_in + active_system.hold + active_system.ramp_out) / 60) .. " min")
+end
 
-    if cyclone_dip_active then
-        cyclone_dip_timer = cyclone_dip_timer - 1
-        -- Linear decay from full magnitude to 0 over the dip duration
-        dip_offset = cyclone_dip_magnitude * (cyclone_dip_timer / CYCLONE_DIP_DURATION_CYCLES)
-        if cyclone_dip_timer <= 0 then
-            cyclone_dip_active = false
-            cyclone_dip_magnitude = 0
+-- Advance the active synoptic system and return its pressure contribution.
+-- When idle (and past the refractory period), rolls for a new system.
+-- The envelope is a smooth cosine ramp in, a hold at full strength, and a
+-- cosine ramp out — giving sustained, realistic pressure trends either side.
+local function advance_synoptic_system(): number
+    if not active_system then
+        if os.time() >= system_refractory_until then
+            local spawn_probability: number = COMPUTE_INTERVAL_SECONDS / SYSTEM_MEAN_INTERVAL_SECONDS
+            if math.random() < spawn_probability then
+                spawn_synoptic_system()
+            end
+        end
+        if not active_system then
+            return 0
         end
     end
 
-    -- Thermal and moisture pressure coupling (from conditions data)
-    -- Warm air rises → lower pressure; cool air sinks → higher pressure
-    -- Moist air is less dense → lower pressure; dry air is denser → higher pressure
-    local thermal_offset: number = 0
-    local moisture_offset: number = 0
+    active_system.elapsed = active_system.elapsed + COMPUTE_INTERVAL_SECONDS
+    local elapsed: number = active_system.elapsed
+
+    if elapsed < active_system.ramp_in then
+        return active_system.magnitude * 0.5 * (1 - math.cos(math.pi * elapsed / active_system.ramp_in))
+    end
+    elapsed = elapsed - active_system.ramp_in
+
+    if elapsed < active_system.hold then
+        return active_system.magnitude
+    end
+    elapsed = elapsed - active_system.hold
+
+    if elapsed < active_system.ramp_out then
+        return active_system.magnitude * 0.5 * (1 + math.cos(math.pi * elapsed / active_system.ramp_out))
+    end
+
+    -- System complete — enter the refractory period
+    ll.OwnerSay("[" .. SCRIPT_ID .. "] Synoptic " .. active_system.kind .. " dissipated.")
+    active_system = nil
+    system_refractory_until = os.time() + SYSTEM_REFRACTORY_SECONDS
+    return 0
+end
+
+-- Thermal/moisture pressure coupling from the conditions data (Proc2).
+-- Warm air rises → lower pressure; moist air is less dense → lower pressure.
+-- Uses fast-vs-slow EMA anomalies so the coupling reacts to unusual spells
+-- rather than to absolute values (which vary by state and season).
+local function compute_coupling_offset(): number
     local conditions: any = read_conditions()
-    if conditions then
-        local temp: number = conditions.temp or seasonal_temp_avg
-        local humidity: number = conditions.humidity or seasonal_humidity_avg
-        thermal_offset = -(temp - seasonal_temp_avg) * TEMP_PRESSURE_FACTOR
-        moisture_offset = -(humidity - seasonal_humidity_avg) * HUMIDITY_PRESSURE_FACTOR
+    if not conditions then
+        return 0
     end
 
-    local total_offset: number = base_offset + noise + dip_offset + thermal_offset + moisture_offset
+    local offset: number = 0
 
-    -- Update rolling history for trend computation
-    table.insert(pressure_offset_history, total_offset)
-    if #pressure_offset_history > PRESSURE_HISTORY_MAX_ENTRIES then
-        table.remove(pressure_offset_history, 1)
+    local temp: number? = conditions.temp
+    if temp then
+        coupling_temp_fast = if coupling_temp_fast then coupling_temp_fast + (temp - coupling_temp_fast) * COUPLING_FAST_EMA_RATE else temp
+        coupling_temp_slow = if coupling_temp_slow then coupling_temp_slow + (temp - coupling_temp_slow) * COUPLING_SLOW_EMA_RATE else temp
+        local thermal: number = -((coupling_temp_fast :: number) - (coupling_temp_slow :: number)) * TEMP_PRESSURE_FACTOR
+        offset = offset + clamp_symmetric(thermal, COUPLING_TEMP_CAP_HPA)
     end
 
-    local trend: number = compute_pressure_trend(pressure_offset_history)
+    local humidity: number? = conditions.humidity
+    if humidity then
+        coupling_humidity_fast = if coupling_humidity_fast then coupling_humidity_fast + (humidity - coupling_humidity_fast) * COUPLING_FAST_EMA_RATE else humidity
+        coupling_humidity_slow = if coupling_humidity_slow then coupling_humidity_slow + (humidity - coupling_humidity_slow) * COUPLING_SLOW_EMA_RATE else humidity
+        local moisture: number = -((coupling_humidity_fast :: number) - (coupling_humidity_slow :: number)) * HUMIDITY_PRESSURE_FACTOR
+        offset = offset + clamp_symmetric(moisture, COUPLING_HUMIDITY_CAP_HPA)
+    end
+
+    return offset
+end
+
+-- Compute one cycle of the background pressure driver.
+-- Returns the total offset (hPa) and trend (hPa/min).
+local function compute_pressure_driver_cycle(): {offset: number, trend: number, system_offset: number}
+    -- Mesoscale wave
+    meso_phase = meso_phase + TWO_PI * COMPUTE_INTERVAL_SECONDS / MESO_PERIOD_SECONDS
+    if meso_phase >= TWO_PI then
+        meso_phase = meso_phase - TWO_PI
+    end
+    local meso_offset: number = MESO_AMPLITUDE_HPA * math.sin(meso_phase)
+
+    -- White noise
+    local noise: number = (math.random() - 0.5) * PRESSURE_NOISE_RANGE_HPA
+
+    -- Synoptic system (lows and highs)
+    local system_offset: number = advance_synoptic_system()
+
+    -- Thermal/moisture anomaly coupling
+    local coupling_offset: number = compute_coupling_offset()
+
+    local total_offset: number = meso_offset + noise + system_offset + coupling_offset
+
+    record_pressure_sample(total_offset)
+    local trend: number = compute_pressure_trend()
 
     return {
         offset = total_offset,
         trend = trend,
-        phase = pressure_phase,
+        system_offset = system_offset,
     }
 end
 
@@ -382,13 +494,19 @@ local function update_pressure_driver(): ()
 
     local pressure_data: any = {
         offset = driver_state.offset,
-        trend = driver_state.trend,
-        phase = driver_state.phase,
+        trend = driver_state.trend,          -- hPa/min
+        system_offset = driver_state.system_offset,
         -- Internal state for reset recovery
-        offset_history = pressure_offset_history,
-        cyclone_dip_active = cyclone_dip_active,
-        cyclone_dip_magnitude = cyclone_dip_magnitude,
-        cyclone_dip_timer = cyclone_dip_timer,
+        meso_phase = meso_phase,
+        system = active_system,              -- nil when quiet (field omitted)
+        refractory_until = system_refractory_until,
+        samples = pressure_samples,
+        coupling = {
+            temp_fast = coupling_temp_fast,
+            temp_slow = coupling_temp_slow,
+            humidity_fast = coupling_humidity_fast,
+            humidity_slow = coupling_humidity_slow,
+        },
     }
 
     lsd_write_json(LSD_KEY_DRIVERS_PRESSURE, pressure_data)
@@ -442,13 +560,6 @@ local function read_wind_config(): ()
                     if targets.wind_variability_base then
                         wind_variability = targets.wind_variability_base
                     end
-                    -- Seasonal averages for pressure-wind coupling
-                    if targets.temp_base then
-                        seasonal_temp_avg = targets.temp_base
-                    end
-                    if targets.humidity then
-                        seasonal_humidity_avg = targets.humidity
-                    end
                 end
                 -- Use the first grid that has wind config
                 break
@@ -460,79 +571,6 @@ local function read_wind_config(): ()
         .. ", base_dir=" .. tostring(wind_base_dir)
         .. ", variability=" .. tostring(wind_variability)
         .. ", sea_dir=" .. tostring(wind_sea_direction))
-end
-
--- Check the grid's current targets for wind modifier changes.
--- If the wind modifiers in the targets differ from what we're currently
--- interpolating toward, start a new ramp to the new values.
--- Also reads the ramp duration (in seconds) from the targets if present.
-local WIND_RAMP_DEFAULT_SECONDS = 300  -- Default ramp: 5 minutes
-local WIND_RAMP_MIN_CYCLES = 4         -- Minimum ramp length (avoid instant transitions)
-
-local function check_wind_modifier_changes(): ()
-    local grids: {string} = get_registered_grids()
-    if not grids or #grids == 0 then return end
-
-    for _, grid_uuid in ipairs(grids) do
-        local targets: any = lsd_read_json(grid_uuid .. ":targets")
-        if targets then
-            local new_speed_mod: number = targets.wind_speed_mod or 0
-            local new_dir_mod: number = targets.wind_dir_mod or 0
-            local new_var_mod: number = targets.wind_variability_mod or 0
-
-            -- Check if the target modifiers have changed
-            if new_speed_mod ~= wind_target_speed_mod
-               or new_dir_mod ~= wind_target_dir_mod
-               or new_var_mod ~= wind_target_var_mod then
-                -- Start a new ramp
-                wind_target_speed_mod = new_speed_mod
-                wind_target_dir_mod = new_dir_mod
-                wind_target_var_mod = new_var_mod
-
-                -- Ramp duration from targets (seconds), or default
-                local ramp_seconds: number = targets.wind_ramp_seconds or WIND_RAMP_DEFAULT_SECONDS
-                local ramp_cycles: number = math.floor(ramp_seconds / COMPUTE_INTERVAL_SECONDS)
-                if ramp_cycles < WIND_RAMP_MIN_CYCLES then
-                    ramp_cycles = WIND_RAMP_MIN_CYCLES
-                end
-                wind_ramp_remaining = ramp_cycles
-                wind_ramp_total = ramp_cycles
-
-                ll.OwnerSay("[" .. SCRIPT_ID .. "] Wind modifier change detected: "
-                    .. "speed_mod=" .. tostring(new_speed_mod)
-                    .. ", dir_mod=" .. tostring(new_dir_mod)
-                    .. ", var_mod=" .. tostring(new_var_mod)
-                    .. ", ramp=" .. tostring(ramp_cycles) .. " cycles ("
-                    .. tostring(ramp_cycles * COMPUTE_INTERVAL_SECONDS) .. "s)")
-            end
-
-            -- Use the first grid
-            break
-        end
-    end
-end
-
--- Advance the state modifier ramp toward target modifiers.
--- When ramp_remaining reaches 0, current mods equal target mods.
-local function advance_wind_ramp(): ()
-    if wind_ramp_remaining <= 0 then
-        wind_speed_mod = wind_target_speed_mod
-        wind_dir_mod = wind_target_dir_mod
-        wind_variability_mod = wind_target_var_mod
-        return
-    end
-
-    local progress: number = 1.0 - (wind_ramp_remaining / wind_ramp_total)
-    -- Linear interpolation from current to target
-    -- (We lerp from the values at ramp start; but since we update each cycle,
-    --  we just move current toward target by the per-cycle fraction)
-    local per_cycle: number = 1.0 / wind_ramp_remaining
-
-    wind_speed_mod = wind_speed_mod + (wind_target_speed_mod - wind_speed_mod) * per_cycle
-    wind_dir_mod = wind_dir_mod + (wind_target_dir_mod - wind_dir_mod) * per_cycle
-    wind_variability_mod = wind_variability_mod + (wind_target_var_mod - wind_variability_mod) * per_cycle
-
-    wind_ramp_remaining = wind_ramp_remaining - 1
 end
 
 -- Compute the diurnal wind factor from the sun position.
@@ -550,23 +588,22 @@ local function compute_diurnal_wind_factor(): number
     return elevation
 end
 
--- Compute one cycle of the wind driver.
--- Produces wind speed and direction based on:
+-- Compute one cycle of the GLOBAL BASE wind driver.
+-- Produces region-wide wind speed and direction based on:
 --   - Calm/gust oscillation (slow sinusoid)
 --   - Diurnal sea/land breeze (from sun position)
 --   - Pressure gradient wind (from pressure trend)
---   - State modifier interpolation
 --   - Direction wandering with noise
-local function compute_wind_driver_cycle(): {speed: number, direction: number, speed_target: number, dir_target: number, ramp_progress: number}
+-- Per-state wind modifiers are applied per grid by Proc2, so grids in
+-- different weather states each get their own wind character on top of
+-- this shared base.
+local function compute_wind_driver_cycle(): {speed: number, direction: number, speed_target: number, dir_target: number}
     -- Advance the calm/gust oscillation phase
     local phase_increment: number = (2 * math.pi) / WIND_OSCILLATION_PERIOD_CYCLES
     wind_phase = wind_phase + phase_increment
 
-    -- Advance state modifier ramp
-    advance_wind_ramp()
-
-    -- Effective variability (seasonal base + state mod)
-    local effective_variability: number = wind_variability + wind_variability_mod
+    -- Effective variability (seasonal base)
+    local effective_variability: number = wind_variability
     if effective_variability < 0 then effective_variability = 0 end
     if effective_variability > 1 then effective_variability = 1 end
 
@@ -578,16 +615,15 @@ local function compute_wind_driver_cycle(): {speed: number, direction: number, s
     -- Pressure gradient wind: read the pressure trend from the driver LSD
     -- (pressure driver is computed before wind driver in the cycle, so the
     -- LSD value is fresh). Falling pressure → stronger wind (storm building).
-    local pressure_trend_hpa_per_cycle: number = 0
+    -- The driver trend is already in hPa/min.
+    local pressure_trend_hpa_per_min: number = 0
     local pressure_data: any = lsd_read_json(LSD_KEY_DRIVERS_PRESSURE)
     if pressure_data and pressure_data.trend then
-        pressure_trend_hpa_per_cycle = pressure_data.trend
+        pressure_trend_hpa_per_min = pressure_data.trend
     end
-    -- Convert trend from hPa/cycle to hPa/min (cycle = COMPUTE_INTERVAL_SECONDS)
-    local pressure_trend_hpa_per_min: number = pressure_trend_hpa_per_cycle / COMPUTE_INTERVAL_SECONDS
     -- Gradient wind: negative trend (falling pressure) → positive wind contribution
     -- (we invert the sign because falling pressure = stronger wind)
-    local gradient_wind: number = -pressure_trend_hpa_per_min * GRADIENT_WIND_FACTOR
+    local gradient_wind: number = clamp_symmetric(-pressure_trend_hpa_per_min * GRADIENT_WIND_FACTOR, GRADIENT_WIND_MAX_KPH)
 
     -- Base speed from oscillation: ranges between calm and gust extremes
     -- sin(phase) ranges -1 to +1
@@ -599,14 +635,14 @@ local function compute_wind_driver_cycle(): {speed: number, direction: number, s
     local diurnal_speed_mod: number = 1.0 + diurnal * WIND_DIURNAL_SPEED_AMPLITUDE
     local base_speed: number = wind_base_speed * speed_multiplier * diurnal_speed_mod
 
-    -- Apply state speed modifier and pressure gradient wind
-    local speed_target: number = base_speed + wind_speed_mod + gradient_wind
+    -- Apply pressure gradient wind
+    local speed_target: number = base_speed + gradient_wind
     if speed_target < WIND_CALM_FLOOR_KPH then speed_target = WIND_CALM_FLOOR_KPH end
 
-    -- Direction target: base + state modifier + diurnal sea breeze shift
+    -- Direction target: base + diurnal sea breeze shift
     -- During day, wind shifts toward the sea direction (onshore breeze)
     -- During night, wind shifts away from the sea (offshore land breeze)
-    local dir_target: number = wind_base_dir + wind_dir_mod
+    local dir_target: number = wind_base_dir
     if wind_sea_direction ~= 0 then
         -- Compute the shortest angular path from base_dir to sea_direction
         local sea_delta: number = wind_sea_direction - wind_base_dir
@@ -636,28 +672,17 @@ local function compute_wind_driver_cycle(): {speed: number, direction: number, s
     while wind_current_dir < 0 do wind_current_dir = wind_current_dir + 360 end
     while wind_current_dir >= 360 do wind_current_dir = wind_current_dir - 360 end
 
-    local ramp_progress: number = 1.0
-    if wind_ramp_total > 0 then
-        ramp_progress = 1.0 - (wind_ramp_remaining / wind_ramp_total)
-        if ramp_progress > 1.0 then ramp_progress = 1.0 end
-        if ramp_progress < 0 then ramp_progress = 0 end
-    end
-
     return {
         speed = wind_current_speed,
         direction = wind_current_dir,
         speed_target = speed_target,
         dir_target = dir_target,
-        ramp_progress = ramp_progress,
     }
 end
 
 -- Compute and write the wind driver state to LSD.
 -- Persists the full internal state so a script reset can resume seamlessly.
 local function update_wind_driver(): ()
-    -- Check for wind modifier changes from grid targets (starts ramp if changed)
-    check_wind_modifier_changes()
-
     local wind_state: any = compute_wind_driver_cycle()
 
     local wind_data: any = {
@@ -665,27 +690,16 @@ local function update_wind_driver(): ()
         direction = wind_state.direction,
         speed_target = wind_state.speed_target,
         dir_target = wind_state.dir_target,
-        ramp_progress = wind_state.ramp_progress,
+        variability = wind_variability,
         -- Internal state for reset recovery
         phase = wind_phase,
         current_speed = wind_current_speed,
         current_dir = wind_current_dir,
-        speed_mod = wind_speed_mod,
-        dir_mod = wind_dir_mod,
-        var_mod = wind_variability_mod,
-        target_speed_mod = wind_target_speed_mod,
-        target_dir_mod = wind_target_dir_mod,
-        target_var_mod = wind_target_var_mod,
-        ramp_remaining = wind_ramp_remaining,
-        ramp_total = wind_ramp_total,
         base_speed = wind_base_speed,
         base_dir = wind_base_dir,
-        variability = wind_variability,
         gust_factor = wind_gust_factor,
         calm_factor = wind_calm_factor,
         sea_direction = wind_sea_direction,
-        seasonal_temp_avg = seasonal_temp_avg,
-        seasonal_humidity_avg = seasonal_humidity_avg,
     }
 
     lsd_write_json(LSD_KEY_DRIVERS_WIND, wind_data)
@@ -698,30 +712,29 @@ end
 -- Initialize Proc3 on script start.
 local function boot_proc3(): ()
     -- Restore pressure driver state from LSD if available (script reset recovery).
-    -- On a cold boot (empty LSD), seed the phase from the clock so different
-    -- boot times start at different points in the sinusoidal cycle.
+    -- On a cold boot (empty LSD), seed the mesoscale phase from the clock so
+    -- different boot times start at different points in the wave.
     local saved_pressure: any = lsd_read_json(LSD_KEY_DRIVERS_PRESSURE)
-    if saved_pressure and saved_pressure.phase then
+    if saved_pressure and saved_pressure.meso_phase then
         -- Warm boot: restore full internal state
-        pressure_phase = saved_pressure.phase
-        if saved_pressure.offset_history then
-            pressure_offset_history = saved_pressure.offset_history
+        meso_phase = saved_pressure.meso_phase
+        if saved_pressure.samples then
+            pressure_samples = saved_pressure.samples
         end
-        if saved_pressure.cyclone_dip_active ~= nil then
-            cyclone_dip_active = saved_pressure.cyclone_dip_active
-        end
-        if saved_pressure.cyclone_dip_magnitude then
-            cyclone_dip_magnitude = saved_pressure.cyclone_dip_magnitude
-        end
-        if saved_pressure.cyclone_dip_timer then
-            cyclone_dip_timer = saved_pressure.cyclone_dip_timer
+        active_system = saved_pressure.system  -- nil when no system was active
+        system_refractory_until = saved_pressure.refractory_until or 0
+        local coupling: any = saved_pressure.coupling
+        if coupling then
+            coupling_temp_fast = coupling.temp_fast
+            coupling_temp_slow = coupling.temp_slow
+            coupling_humidity_fast = coupling.humidity_fast
+            coupling_humidity_slow = coupling.humidity_slow
         end
     else
-        -- Cold boot: seed phase from unix time so the sinusoid doesn't
-        -- always start at zero. One full cycle = PRESSURE_PERIOD_CYCLES * COMPUTE_INTERVAL_SECONDS
-        -- = 480 * 2.5 = 1200 seconds. Map current time into [0, 2π).
-        local cycle_position: number = (os.time() % PRESSURE_SEED_DIVISOR) / PRESSURE_SEED_DIVISOR
-        pressure_phase = cycle_position * 2 * math.pi
+        -- Cold boot (or pre-redesign LSD format): seed the mesoscale phase
+        -- from unix time so the wave doesn't always start at zero.
+        local cycle_position: number = (os.time() % MESO_PERIOD_SECONDS) / MESO_PERIOD_SECONDS
+        meso_phase = cycle_position * TWO_PI
     end
 
     -- Restore wind driver state from LSD if available (script reset recovery).
@@ -730,26 +743,12 @@ local function boot_proc3(): ()
         wind_phase = saved_wind.phase
         wind_current_speed = saved_wind.current_speed or 0
         wind_current_dir = saved_wind.current_dir or 0
-        wind_speed_mod = saved_wind.speed_mod or 0
-        wind_dir_mod = saved_wind.dir_mod or 0
-        wind_variability_mod = saved_wind.var_mod or 0
-        wind_target_speed_mod = saved_wind.target_speed_mod or 0
-        wind_target_dir_mod = saved_wind.target_dir_mod or 0
-        wind_target_var_mod = saved_wind.target_var_mod or 0
-        wind_ramp_remaining = saved_wind.ramp_remaining or 0
-        wind_ramp_total = saved_wind.ramp_total or 0
         wind_base_speed = saved_wind.base_speed or 15
         wind_base_dir = saved_wind.base_dir or 337.5
         wind_variability = saved_wind.variability or 0.3
         wind_gust_factor = saved_wind.gust_factor or 0.5
         wind_calm_factor = saved_wind.calm_factor or 0.3
         wind_sea_direction = saved_wind.sea_direction or 0
-        if saved_wind.seasonal_temp_avg then
-            seasonal_temp_avg = saved_wind.seasonal_temp_avg
-        end
-        if saved_wind.seasonal_humidity_avg then
-            seasonal_humidity_avg = saved_wind.seasonal_humidity_avg
-        end
     else
         -- Cold boot: seed wind phase from unix time (same divisor as pressure,
         -- 1200s = one full oscillation cycle)
@@ -776,8 +775,8 @@ local function boot_proc3(): ()
     end)
 
     ll.OwnerSay("[" .. SCRIPT_ID .. "] Proc3 is ready. Computing every "
-        .. tostring(COMPUTE_INTERVAL_SECONDS) .. "s. Pressure phase: "
-        .. string.format("%.3f", pressure_phase) .. " rad, Wind phase: "
+        .. tostring(COMPUTE_INTERVAL_SECONDS) .. "s. Meso phase: "
+        .. string.format("%.3f", meso_phase) .. " rad, Wind phase: "
         .. string.format("%.3f", wind_phase) .. " rad"
         .. "\n  Wind config: base_speed=" .. tostring(wind_base_speed)
         .. ", base_dir=" .. tostring(wind_base_dir)

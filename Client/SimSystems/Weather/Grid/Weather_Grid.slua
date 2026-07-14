@@ -93,11 +93,12 @@ local BOOTSTRAP_DELTA_CLOUDY_HPA = -5  -- Pressure >5 hPa below → Cloudy
 local BOOTSTRAP_DELTA_PARTLY_HPA = -2  -- Pressure >2 hPa below → Partly Cloudy
 local BOOTSTRAP_TREND_THRESHOLD = -0.2 -- hPa/min trend for event trigger
 
--- Season blending
-local SEASON_BLEND_DAYS = 7  -- Last N days of season blend toward next
-
--- Duration conversion
-local CYCLES_PER_HOUR = 240  -- At 15-second poll intervals, 1 hour = 240 cycles
+-- Duration conversion. The poll jitter is chosen once at boot and the
+-- actual interval is used for hour→cycle conversion, so state durations
+-- stay accurate regardless of the jitter this grid happened to roll.
+local ACTUAL_POLL_INTERVAL_SECONDS: number = POLL_INTERVAL_SECONDS
+    + math.random(-POLL_JITTER_SECONDS, POLL_JITTER_SECONDS)
+local CYCLES_PER_HOUR: number = 3600 / ACTUAL_POLL_INTERVAL_SECONDS
 
 --================================================//
 
@@ -126,6 +127,7 @@ local current_state_name: string = ""  -- "Clear Skies", "Khamsin", etc.
 local current_state_params: any = {}  -- Accumulated key=value pairs for current state
 local current_grid_config: any = {}  -- Accumulated key=value pairs for grid section
 local current_season_config: any = {}  -- Accumulated key=value pairs for season-level fields
+local season_event_states: { [string]: {string} } = {}  -- Per-season list of states with event=true
 
 --================================================//
 
@@ -309,9 +311,23 @@ local function flush_current_state(): ()
     if current_state_name ~= "" and current_season ~= "" then
         local lsd_key: string = current_season .. ":" .. current_state_name
         lsd_write_json(lsd_key, current_state_params)
+        -- Track event states per season (used by bootstrap evaluation)
+        if current_state_params.event == true then
+            if not season_event_states[current_season] then
+                season_event_states[current_season] = {}
+            end
+            table.insert(season_event_states[current_season], current_state_name)
+        end
     end
     current_state_name = ""
     current_state_params = {}
+end
+
+-- Write the per-season event-state lists to LSD.
+local function flush_season_events(): ()
+    for season_name, event_list in pairs(season_event_states) do
+        lsd_write_json("season_events:" .. season_name, event_list)
+    end
 end
 
 -- Write the current grid config to LSD.
@@ -405,6 +421,7 @@ local function start_notecard_load(): ()
     current_state_name = ""
     current_state_params = {}
     current_grid_config = {}
+    season_event_states = {}
 
     -- Request the line count (async — dataserver event will deliver it)
     notecard_linecount_query_id = ll.GetNumberOfNotecardLines(NOTECARD_NAME)
@@ -447,6 +464,7 @@ local function handle_notecard_line_data(query_id: string, data: string): ()
         -- Notecard fully loaded — flush remaining state and config
         flush_current_state()
         flush_grid_config()
+        flush_season_events()
         -- Flush any remaining season config
         if current_season ~= "" and next(current_season_config) then
             lsd_write_json("season:" .. current_season, current_season_config)
@@ -564,17 +582,22 @@ local function compute_pressure_trend(transition_state: any): number
         return 0
     end
 
-    -- Linear regression: timestamp vs pressure
+    -- Linear regression: timestamp vs pressure.
+    -- Timestamps are offset from the first reading before squaring — raw
+    -- unix times (~1.7e9) squared lose enough float precision to corrupt
+    -- the slope.
+    local base_time: number = recent[1].ts
     local sum_x: number = 0
     local sum_y: number = 0
     local sum_xy: number = 0
     local sum_x_squared: number = 0
 
     for _, entry in ipairs(recent) do
-        sum_x = sum_x + entry.ts
+        local x: number = entry.ts - base_time
+        sum_x = sum_x + x
         sum_y = sum_y + entry.val
-        sum_xy = sum_xy + entry.ts * entry.val
-        sum_x_squared = sum_x_squared + entry.ts * entry.ts
+        sum_xy = sum_xy + x * entry.val
+        sum_x_squared = sum_x_squared + x * x
     end
 
     local denominator: number = entry_count * sum_x_squared - sum_x * sum_x
@@ -1000,9 +1023,10 @@ end
 
 -- On first poll after boot, check if conditions strongly indicate
 -- a state other than Clear Skies. If so, jump directly.
-local function bootstrap_evaluate(current_values: any, season: string): any
+-- pressure_trend comes from the evolution payload (driver trend, hPa/min) —
+-- the grid has no pressure history of its own yet on the first poll.
+local function bootstrap_evaluate(current_values: any, pressure_trend: number, season: string): any
     local pressure: number = current_values.pressure or 1013
-    local pressure_trend: number = current_values.pressure_trend or 0
 
     local clear_skies: any = get_state_definition(season, "Clear Skies")
     if not clear_skies then return nil end
@@ -1012,10 +1036,9 @@ local function bootstrap_evaluate(current_values: any, season: string): any
 
     -- Rapid drop + very low pressure → event state
     if delta < BOOTSTRAP_DELTA_EVENT_HPA and pressure_trend < BOOTSTRAP_TREND_THRESHOLD then
-        -- Find an event state in this season.
-        -- These are the known event states across all seasons.
-        -- Both have event=true in the notecard.
-        local event_names: {string} = {"Khamsin", "Storm"}
+        -- Find an event state in this season (recorded from the notecard
+        -- during parsing — any state with event = true).
+        local event_names: {string} = lsd_read_json("season_events:" .. season) or {}
         for _, name in ipairs(event_names) do
             local def: any = get_state_definition(season, name)
             if def and def.event then
@@ -1028,13 +1051,19 @@ local function bootstrap_evaluate(current_values: any, season: string): any
     -- Moderate drop → Cloudy
     if delta < BOOTSTRAP_DELTA_CLOUDY_HPA then
         local cloudy: any = get_state_definition(season, "Cloudy")
-        if cloudy then return cloudy end
+        if cloudy then
+            cloudy._name = "Cloudy"
+            return cloudy
+        end
     end
 
     -- Slight drop → Partly Cloudy
     if delta < BOOTSTRAP_DELTA_PARTLY_HPA then
         local partly: any = get_state_definition(season, "Partly Cloudy")
-        if partly then return partly end
+        if partly then
+            partly._name = "Partly Cloudy"
+            return partly
+        end
     end
 
     return nil  -- Stay in Clear Skies
@@ -1372,7 +1401,8 @@ local function handle_state_resp(values: any, evolution: any): ()
     -- Bootstrap evaluation on first poll
     if is_first_poll then
         is_first_poll = false
-        local bootstrap_state: any = bootstrap_evaluate(values, season)
+        local driver_trend: number = (evolution and evolution.pressure_trend) or 0
+        local bootstrap_state: any = bootstrap_evaluate(values, driver_trend, season)
         if bootstrap_state then
             local bootstrap_name: string = bootstrap_state._name or "Unknown"
             execute_state_transition(bootstrap_name, bootstrap_state, season, transition_state, "bootstrap: pressure delta from baseline", true)
@@ -1421,10 +1451,7 @@ start_polling = function(): ()
         return
     end
 
-    local jitter: number = math.random(-POLL_JITTER_SECONDS, POLL_JITTER_SECONDS)
-    local interval: number = POLL_INTERVAL_SECONDS + jitter
-
-    poll_timer_handler = LLTimers:every(interval, function()
+    poll_timer_handler = LLTimers:every(ACTUAL_POLL_INTERVAL_SECONDS, function()
         check_pending_transition()
         send_state_poll()
     end)

@@ -1,5 +1,37 @@
 # Wind Driver Design
 
+> **Status: IMPLEMENTED (with amendments).** This document was the design
+> proposal for moving wind out of Proc2's per-state relaxation. The driver has
+> since been implemented in Proc3 with one significant amendment (below).
+> Authoritative maths now live in SIMULATION_MATHS.md section 4; this document
+> is kept for design rationale.
+
+## Implementation amendments
+
+1. **State modifiers are applied per grid by Proc2, not globally by Proc3.**
+   The original design had Proc3 interpolate `wind_speed_mod` /
+   `wind_dir_mod` from "the" grid's targets. That breaks with multiple
+   registered grids (they would fight over the shared modifiers, and only
+   the first grid was ever read). Proc3 now computes only the region-global
+   base wind (oscillation, diurnal breeze, gradient wind, wander);
+   Proc2 adds each grid's state modifiers on top and gives each grid its own
+   direction wander scaled by `wind_variability_mod`. Modifier ramping
+   happens through Proc2's per-grid target interpolation over
+   `wind_ramp_seconds` — Proc3's modifier-ramp machinery and the
+   `ramp_progress` field were removed.
+2. **Two-phase transitions** are implemented as designed (grid pushes
+   targets, waits `wind_ramp_seconds`, then commits EEP/particles).
+3. **Gradient wind** is computed from the driver trend (hPa/min) with
+   factor 25 and capped at ±25 kph. (An earlier implementation had a unit
+   bug that made it 60× weaker than intended.)
+4. `drivers:wind` published fields: `speed`, `direction`, `speed_target`,
+   `dir_target`, `variability`, plus internal state for reset recovery
+   (`phase`, `current_speed`, `current_dir`, `base_speed`, `base_dir`,
+   `gust_factor`, `calm_factor`, `sea_direction`).
+
+Problem-statement item 3 (the noise formula) has also been fixed in Proc2
+(`abs(target - current) + 1`).
+
 ## Problem Statement
 
 The current wind model has several issues:

@@ -364,26 +364,31 @@
     duration = 7-14
     eep_preset = Clear_Shemu_Day
     particle = none
-    # Normal summer progression: humidity builds into haze
+    # Normal summer progression: humidity builds into haze during evening/night
+    # as temperature drops and relative humidity rises. Gated to evening+night
+    # so diverge paths get exclusive windows in morning (Coastal Mist) and
+    # day (Heat Wave). Sirocco can fire anytime when dry + low pressure.
     progresses_to = Hazy Heat
     progress_humidity_min = 72
+    progress_evening = true
+    progress_night = true
     progress_logic = or
     # Divergences to special summer states (per-target conditions)
     diverges_to = Heat Wave, Coastal Mist, Sirocco
-    # Heat wave: hotter than base, can happen mid-day
+    # Heat wave: hotter than base, mid-day only
     # (peak temp is ~30.5C minus ~1C daytime sea cooling, so 28C leaves margin)
     diverge_Heat_Wave_temp_min = 28
     diverge_Heat_Wave_day = true
     diverge_Heat_Wave_logic = and
-    # Coastal mist: morning only, very humid
-    # (target 65 + maritime boost sits around 69-73, so 72 catches it)
-    diverge_Coastal_Mist_humidity_min = 72
+    # Coastal mist: morning only, humid air from the sea
+    # (target 65 + maritime boost ~73, so 70 catches it reliably)
+    diverge_Coastal_Mist_humidity_min = 70
     diverge_Coastal_Mist_morning = true
     diverge_Coastal_Mist_logic = and
-    # Sirocco: hot dry wind from the south/southeast, picks up dust
-    # (wind >20 and humidity <55 cannot happen together because daytime sea breeze
-    #  is needed for high wind but also brings humidity. Use dry + low pressure.)
-    diverge_Sirocco_humidity_max = 55
+    # Sirocco: hot dry wind from the south, picks up dust
+    # (offshore wind drops humidity target to ~57, so 60 is reachable.
+    #  Pressure must also be low — both together filter for true desert air.)
+    diverge_Sirocco_humidity_max = 60
     diverge_Sirocco_pressure_max = 1006
     diverge_Sirocco_logic = and
     # Shemu = low flood. Exposed riverbed silt increases dust availability.

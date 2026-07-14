@@ -204,7 +204,7 @@ p = [grid_uuid, values, evolution]
 |---|---|---|---|
 | 1 | grid_uuid | string | Object UUID of the grid prim |
 | 2 | values | object | Computed micro values: `{temp, humidity, pressure, wind_speed, wind_dir, precipitation, dust, visibility}` |
-| 3 | evolution | object | Macro/evolution data: `{pressure_trend, pressure_driver_offset}` — the driver trend from Proc3, for grid cross-checking against its local trend |
+| 3 | evolution | object | Macro/evolution data: `{pressure_trend, pressure_driver_offset}` — the driver trend from Proc3 in **hPa/min** over a 5-minute window (same unit and window as the grid's local trend and all notecard `*_trend_*` thresholds), for grid cross-checking against its local trend and for bootstrap evaluation |
 
 Optional method: `"full"` (default, all fields) or `"delta"` (only changed fields since last poll — future optimization, not in v1).
 
@@ -355,21 +355,21 @@ drivers:flood_state                → {"state": "peak", "day_of_year": 258}
                                       Readers: Proc1, Proc2 (applied per-grid when nile_adjacent=true)
                                       Computed from calendar. States: low, rising, peak, receding.
 
-drivers:pressure                   → {"offset": -3.2, "trend": -0.15, "phase": 1.7}
+drivers:pressure                   → {"offset": -3.2, "trend": -0.15, "system_offset": -12.0,
+                                      "meso_phase": 1.7, "system": {...}, "refractory_until": ...,
+                                      "samples": [...], "coupling": {...}}
                                       Writer: Proc3
                                       Readers: Proc2 (mixes into pressure evolution), Proc1 (exposes trend to grid via STATE_RESP)
                                       Background atmospheric pressure variation — an independent external
-                                      signal not tied to any grid's targets. Proc3 generates a slow
-                                      sinusoidal pressure wave with stochastic noise, simulating passing
-                                      pressure systems. Proc3 also incorporates thermal/moisture coupling
-                                      from `drivers:conditions` (temperature and humidity influence on
-                                      pressure), so the pressure driver responds to environmental
-                                      conditions rather than operating in isolation. Proc2 adds the
-                                      offset to its computed pressure; Proc1 includes the trend in
+                                      signal not tied to any grid's targets. Proc3 layers synoptic systems
+                                      (rare, coherent lows/highs with cosine ramp envelopes), a 1-hour
+                                      mesoscale wave, white noise, and EMA-anomaly thermal/moisture coupling
+                                      from `drivers:conditions`. Proc2 adds the offset to its computed
+                                      pressure; Proc1 includes the trend (hPa/min, 5-min window) in
                                       macro:evolution so the grid can evaluate it for progression
-                                      decisions. This gives the grid an independent signal to evaluate,
-                                      preventing the circular dependency where the grid only sees
-                                      reflections of its own target decisions.
+                                      decisions and bootstrap. This gives the grid an independent signal
+                                      to evaluate, preventing the circular dependency where the grid only
+                                      sees reflections of its own target decisions.
 
 drivers:extreme_weather            → {"active": false, "type": null, ...}
                                       Writer: Proc3
@@ -377,15 +377,17 @@ drivers:extreme_weather            → {"active": false, "type": null, ...}
                                       Reserved for future extreme weather overrides. Not implemented in v1.
 
 drivers:wind                       → {"speed": 14.5, "direction": 338.2, "speed_target": 15.0,
-                                      "dir_target": 337.5, "ramp_progress": 1.0, ...internal_state}
+                                      "dir_target": 337.5, "variability": 0.3, ...internal_state}
                                       Writer: Proc3
-                                      Readers: Proc2 (uses speed/direction directly instead of relaxing
-                                      toward notecard wind targets)
-                                      Global wind driver — Proc3 simulates wind speed and direction
-                                      independently with calm/gust oscillation cycles, direction wandering,
-                                      and state modifier interpolation. Proc2 reads this driver and applies
-                                      the wind values directly, then computes maritime influence from the
-                                      wind direction. Internal state (phase, mods, ramp) is persisted for
+                                      Readers: Proc2 (applies per-grid state modifiers on top of speed/direction)
+                                      Global BASE wind driver — Proc3 simulates the region-global wind
+                                      speed and direction independently with calm/gust oscillation cycles,
+                                      diurnal sea/land breeze, pressure-gradient wind, and direction
+                                      wandering. Per-state modifiers (`wind_speed_mod`, `wind_dir_mod`,
+                                      `wind_variability_mod`) are applied PER GRID by Proc2 (ramped via
+                                      target interpolation), so two grids in different states experience
+                                      different wind from the same base driver. Internal state (phase,
+                                      base speed/dir, gust/calm factors, sea direction) is persisted for
                                       reset recovery.
 
 drivers:conditions                 → {"temp": 26.0, "humidity": 68.5, "pressure": 1009.0,
