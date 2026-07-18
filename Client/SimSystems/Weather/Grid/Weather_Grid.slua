@@ -87,6 +87,21 @@ local PRESSURE_HISTORY_RETENTION_SECONDS = 600  -- 10-minute retention
 local TRANSITION_COOLDOWN_CYCLES = 6         -- Cycles to wait after a transition (6 * 15s = 90s)
 local TRANSITION_HISTORY_MAX = 20            -- Max entries in transition history log
 
+-- Recurrence guarantees: states that haven't occurred recently receive a
+-- growing score bonus during duration-expiry selection, so every normal
+-- state configured for a season shows up periodically instead of merely
+-- having nonzero probability.
+local OVERDUE_REFERENCE_HOURS = 24           -- Hours of absence that double a state's expiry score
+local OVERDUE_MAX_MULTIPLIER = 6             -- Cap on the overdue bonus multiplier
+
+-- Admin target bias: additive easing applied to non-trend condition
+-- thresholds of the biased candidate (trend thresholds are scaled toward
+-- zero by the bias threshold multiplier instead, since they live near 0).
+local BIAS_EASE_HUMIDITY = 8                 -- Humidity thresholds eased by this many %-points
+local BIAS_EASE_PRESSURE = 3                 -- Pressure thresholds eased by this many hPa
+local BIAS_EASE_TEMP = 2                     -- Temperature thresholds eased by this many degrees C
+local BIAS_EASE_WIND = 5                     -- Wind-speed thresholds eased by this many kph
+
 -- Bootstrap evaluation thresholds (from SIMULATION_MATHS.md section 6)
 local BOOTSTRAP_DELTA_EVENT_HPA = -8   -- Pressure >8 hPa below baseline → event state
 local BOOTSTRAP_DELTA_CLOUDY_HPA = -5  -- Pressure >5 hPa below → Cloudy
@@ -128,6 +143,7 @@ local current_state_params: any = {}  -- Accumulated key=value pairs for current
 local current_grid_config: any = {}  -- Accumulated key=value pairs for grid section
 local current_season_config: any = {}  -- Accumulated key=value pairs for season-level fields
 local season_event_states: { [string]: {string} } = {}  -- Per-season list of states with event=true
+local season_state_names: { [string]: {string} } = {}  -- Per-season list of all state names (registry)
 
 --================================================//
 
@@ -318,6 +334,11 @@ local function flush_current_state(): ()
             end
             table.insert(season_event_states[current_season], current_state_name)
         end
+        -- Track all state names per season (used by admin name resolution)
+        if not season_state_names[current_season] then
+            season_state_names[current_season] = {}
+        end
+        table.insert(season_state_names[current_season], current_state_name)
     end
     current_state_name = ""
     current_state_params = {}
@@ -327,6 +348,13 @@ end
 local function flush_season_events(): ()
     for season_name, event_list in pairs(season_event_states) do
         lsd_write_json("season_events:" .. season_name, event_list)
+    end
+end
+
+-- Write the per-season state-name registries to LSD.
+local function flush_season_states(): ()
+    for season_name, name_list in pairs(season_state_names) do
+        lsd_write_json("season_states:" .. season_name, name_list)
     end
 end
 
@@ -422,6 +450,7 @@ local function start_notecard_load(): ()
     current_state_params = {}
     current_grid_config = {}
     season_event_states = {}
+    season_state_names = {}
 
     -- Request the line count (async — dataserver event will deliver it)
     notecard_linecount_query_id = ll.GetNumberOfNotecardLines(NOTECARD_NAME)
@@ -465,6 +494,7 @@ local function handle_notecard_line_data(query_id: string, data: string): ()
         flush_current_state()
         flush_grid_config()
         flush_season_events()
+        flush_season_states()
         -- Flush any remaining season config
         if current_season ~= "" and next(current_season_config) then
             lsd_write_json("season:" .. current_season, current_season_config)
@@ -535,6 +565,27 @@ end
 -- Get a state definition from LSD by season and state name.
 local function get_state_definition(season: string, state_name: string): any
     return lsd_read_json(season .. ":" .. state_name)
+end
+
+-- Resolve a user-supplied state name case-insensitively against the
+-- season's state registry. Returns the canonical name, or nil if the
+-- state does not exist in this season.
+local function resolve_state_name(season: string, requested_name: string): string?
+    local names: {string} = lsd_read_json("season_states:" .. season) or {}
+    local lowered: string = string.lower(trim_string(requested_name or ""))
+    if lowered == "" then return nil end
+    for _, name in ipairs(names) do
+        if string.lower(name) == lowered then
+            return name
+        end
+    end
+    return nil
+end
+
+-- Comma-separated list of valid state names for a season (for admin feedback).
+local function list_season_states(season: string): string
+    local names: {string} = lsd_read_json("season_states:" .. season) or {}
+    return table.concat(names, ", ")
 end
 
 --================================================//
@@ -715,15 +766,42 @@ end
 -- target_name: name of the state we're transitioning TO (used for per-target conditions)
 -- local_trend: time-windowed pressure trend in hPa/min
 -- current_values: the latest computed values from STATE_RESP
-local function check_progression_condition(path_type: string, current_state_def: any, target_name: string, local_trend: number, current_values: any): boolean
+-- bias_multiplier: if non-nil, this candidate is the admin-biased target and
+--   its condition thresholds are eased in the permissive direction. Trend
+--   thresholds are moved toward zero by (1 - multiplier); other thresholds
+--   are shifted by the fixed BIAS_EASE_* amounts. The measured values are
+--   never altered — only what they are compared against.
+local function check_progression_condition(path_type: string, current_state_def: any, target_name: string, local_trend: number, current_values: any, bias_multiplier: number?): boolean
     local pressure: number = current_values.pressure or 1013
     local humidity: number = current_values.humidity or 50
     local temp: number = current_values.temp or 25
     local wind_speed: number = current_values.wind_speed or 0
 
+    local eased: boolean = bias_multiplier ~= nil
+    local trend_ease_fraction: number = 1 - (bias_multiplier or 1)
+
+    -- Move a trend threshold toward zero (easier to cross from either side).
+    local function ease_trend_max(threshold: any): any
+        if threshold == nil or not eased then return threshold end
+        return threshold + math.abs(threshold) * trend_ease_fraction
+    end
+    local function ease_trend_min(threshold: any): any
+        if threshold == nil or not eased then return threshold end
+        return threshold - math.abs(threshold) * trend_ease_fraction
+    end
+    -- Shift a max-gate up / min-gate down by a fixed easing amount.
+    local function ease_max(threshold: any, amount: number): any
+        if threshold == nil or not eased then return threshold end
+        return threshold + amount
+    end
+    local function ease_min(threshold: any, amount: number): any
+        if threshold == nil or not eased then return threshold end
+        return threshold - amount
+    end
+
     if path_type == "progress" then
-        local trend_threshold: number = get_condition_value(current_state_def, "progress", target_name, "trend_max")
-        local humidity_threshold: number = get_condition_value(current_state_def, "progress", target_name, "humidity_min")
+        local trend_threshold: number = ease_trend_max(get_condition_value(current_state_def, "progress", target_name, "trend_max"))
+        local humidity_threshold: number = ease_min(get_condition_value(current_state_def, "progress", target_name, "humidity_min"), BIAS_EASE_HUMIDITY)
         local logic: string = get_condition_value(current_state_def, "progress", target_name, "logic") or PROGRESS_DEFAULT_LOGIC
 
         -- If no condition fields are defined, the path never triggers
@@ -754,8 +832,8 @@ local function check_progression_condition(path_type: string, current_state_def:
         end
 
     elseif path_type == "regress" then
-        local trend_threshold: number = get_condition_value(current_state_def, "regress", target_name, "trend_min")
-        local humidity_threshold: number = get_condition_value(current_state_def, "regress", target_name, "humidity_max")
+        local trend_threshold: number = ease_trend_min(get_condition_value(current_state_def, "regress", target_name, "trend_min"))
+        local humidity_threshold: number = ease_max(get_condition_value(current_state_def, "regress", target_name, "humidity_max"), BIAS_EASE_HUMIDITY)
         local logic: string = get_condition_value(current_state_def, "regress", target_name, "logic") or REGRESS_DEFAULT_LOGIC
 
         if not trend_threshold and not humidity_threshold then
@@ -783,13 +861,13 @@ local function check_progression_condition(path_type: string, current_state_def:
         end
 
     elseif path_type == "diverge" then
-        local pressure_threshold: number = get_condition_value(current_state_def, "diverge", target_name, "pressure_max")
-        local trend_threshold: number = get_condition_value(current_state_def, "diverge", target_name, "trend_max")
-        local humidity_min_threshold: number = get_condition_value(current_state_def, "diverge", target_name, "humidity_min")
-        local humidity_max_threshold: number = get_condition_value(current_state_def, "diverge", target_name, "humidity_max")
-        local temp_min_threshold: number = get_condition_value(current_state_def, "diverge", target_name, "temp_min")
-        local wind_min_threshold: number = get_condition_value(current_state_def, "diverge", target_name, "wind_speed_min")
-        local wind_max_threshold: number = get_condition_value(current_state_def, "diverge", target_name, "wind_speed_max")
+        local pressure_threshold: number = ease_max(get_condition_value(current_state_def, "diverge", target_name, "pressure_max"), BIAS_EASE_PRESSURE)
+        local trend_threshold: number = ease_trend_max(get_condition_value(current_state_def, "diverge", target_name, "trend_max"))
+        local humidity_min_threshold: number = ease_min(get_condition_value(current_state_def, "diverge", target_name, "humidity_min"), BIAS_EASE_HUMIDITY)
+        local humidity_max_threshold: number = ease_max(get_condition_value(current_state_def, "diverge", target_name, "humidity_max"), BIAS_EASE_HUMIDITY)
+        local temp_min_threshold: number = ease_min(get_condition_value(current_state_def, "diverge", target_name, "temp_min"), BIAS_EASE_TEMP)
+        local wind_min_threshold: number = ease_min(get_condition_value(current_state_def, "diverge", target_name, "wind_speed_min"), BIAS_EASE_WIND)
+        local wind_max_threshold: number = ease_max(get_condition_value(current_state_def, "diverge", target_name, "wind_speed_max"), BIAS_EASE_WIND)
         local logic: string = get_condition_value(current_state_def, "diverge", target_name, "logic") or DIVERGE_DEFAULT_LOGIC
 
         local has_conditions: boolean = pressure_threshold or trend_threshold
@@ -872,23 +950,45 @@ local function gather_progression_candidates(state_def: any): {{type: string, na
     return candidates
 end
 
--- Pick among multiple ready candidates using weight as tiebreaker.
-local function pick_among_ready(ready_candidates: {{def: any, name: string}}, season: string): any
-    local total_weight: number = 0
-    for _, cand in ipairs(ready_candidates) do
-        total_weight = total_weight + (cand.def.weight or 1)
+-- Hours since a state last occurred on this grid (or since tracking began,
+-- if it has never occurred). Used for the overdue recurrence bonus.
+local function hours_since_seen(transition_state: any, state_name: string): number
+    local last_seen: any = transition_state.last_seen or {}
+    local seen_at: number = last_seen[state_name] or transition_state.tracking_since or os.time()
+    return math.max(0, (os.time() - seen_at) / 3600)
+end
+
+-- Score a candidate for weighted selection. Combines the authored weight,
+-- an overdue recurrence bonus (states unseen for a long time score higher,
+-- so every configured state recurs periodically), and the admin target bias.
+local function candidate_score(def: any, name: string, transition_state: any, active_bias_target: string?, bias_weight_multiplier: number): number
+    local score: number = def.weight or 1
+    local overdue_multiplier: number = 1 + hours_since_seen(transition_state, name) / OVERDUE_REFERENCE_HOURS
+    score = score * math.min(overdue_multiplier, OVERDUE_MAX_MULTIPLIER)
+    if active_bias_target and name == active_bias_target then
+        score = score * bias_weight_multiplier
+    end
+    return score
+end
+
+-- Weighted-random pick among scored candidates. Each entry must carry a
+-- positive .score field. Returns the chosen entry.
+local function pick_by_score(scored_candidates: {any}): any
+    local total_score: number = 0
+    for _, cand in ipairs(scored_candidates) do
+        total_score = total_score + (cand.score or 1)
     end
 
-    local roll: number = math.random() * total_weight
+    local roll: number = math.random() * total_score
     local cumulative: number = 0
-    for _, cand in ipairs(ready_candidates) do
-        cumulative = cumulative + (cand.def.weight or 1)
+    for _, cand in ipairs(scored_candidates) do
+        cumulative = cumulative + (cand.score or 1)
         if roll <= cumulative then
-            return cand.def
+            return cand
         end
     end
 
-    return ready_candidates[1].def
+    return scored_candidates[1]
 end
 
 -- Evaluate progression for the current state.
@@ -944,29 +1044,26 @@ local function evaluate_progression(current_state_def: any, season: string, curr
     local candidates: {{type: string, name: string}} = gather_progression_candidates(current_state_def)
 
     -- Check which candidates have their condition met
-    local ready: {{def: any, name: string, path_type: string}} = {}
+    local ready: {any} = {}
     for _, cand in ipairs(candidates) do
         local def: any = get_state_definition(season, cand.name)
         if def then
             def._name = cand.name  -- Tag for display/debugging
 
-            -- Apply bias: if this candidate is the biased target, ease thresholds
-            -- by scaling the trend requirement down (closer to 0 = easier to trigger).
-            local effective_trend: number = local_trend
+            -- If this candidate is the biased target, its condition thresholds
+            -- are eased in the permissive direction (measured values untouched).
+            local bias_multiplier: number? = nil
             if active_bias_target and cand.name == active_bias_target then
-                effective_trend = local_trend * bias_threshold_multiplier
+                bias_multiplier = bias_threshold_multiplier
             end
 
             -- Conditions are read from the current state's definition (where the
             -- progression edges are declared), not from the target state.
             -- target_name lets us look up per-target condition overrides.
-            local condition_met: boolean = check_progression_condition(cand.type, current_state_def, cand.name, effective_trend, current_values)
+            local condition_met: boolean = check_progression_condition(cand.type, current_state_def, cand.name, local_trend, current_values, bias_multiplier)
             if condition_met then
-                -- Apply bias weight multiplier to the biased candidate
-                if active_bias_target and cand.name == active_bias_target then
-                    def.weight = (def.weight or 1) * bias_weight_multiplier
-                end
-                table.insert(ready, {def = def, name = cand.name, path_type = cand.type})
+                local score: number = candidate_score(def, cand.name, transition_state, active_bias_target, bias_weight_multiplier)
+                table.insert(ready, {def = def, name = cand.name, path_type = cand.type, score = score})
             end
         end
     end
@@ -978,27 +1075,51 @@ local function evaluate_progression(current_state_def: any, season: string, curr
         return ready[1].name, ready[1].def, ready[1].path_type .. " condition met → " .. ready[1].name
     end
 
-    -- If multiple candidates are ready, use weight as tiebreaker
+    -- If multiple candidates are ready, weighted pick by score
+    -- (authored weight × overdue bonus × target bias)
     if #ready > 1 then
-        local chosen: any = pick_among_ready(ready, season)
-        local chosen_name: string = chosen._name or "Unknown"
+        local chosen: any = pick_by_score(ready)
         transition_state.cooldown = TRANSITION_COOLDOWN_CYCLES
         transition_state.duration_timer = 0
-        return chosen_name, chosen, "multiple conditions met, weighted pick → " .. chosen_name
+        return chosen.name, chosen.def, "multiple conditions met, weighted pick → " .. chosen.name
     end
 
     -- No candidates ready — check duration expiry
     local duration_target: number = transition_state.duration_target or 999
 
     if duration_timer >= duration_target then
-        -- Duration expired — prefer regression, then progression
+        -- Duration expired — weighted pick among all legal non-event exits.
+        -- Value-threshold gates are relaxed (the state has overstayed its
+        -- duration and must move on), but sun-phase gates still apply so
+        -- time-of-day states can't appear at the wrong hour, and event
+        -- states keep their strict meteorological triggers.
+        local pool: {any} = {}
+        for _, cand in ipairs(candidates) do
+            local def: any = get_state_definition(season, cand.name)
+            if def and not def.event and sun_phase_allowed(cand.type, current_state_def, cand.name) then
+                def._name = cand.name
+                local score: number = candidate_score(def, cand.name, transition_state, active_bias_target, bias_weight_multiplier)
+                table.insert(pool, {def = def, name = cand.name, path_type = cand.type, score = score})
+            end
+        end
+
+        if #pool > 0 then
+            local chosen: any = pick_by_score(pool)
+            transition_state.cooldown = TRANSITION_COOLDOWN_CYCLES
+            transition_state.duration_timer = 0
+            return chosen.name, chosen.def, "duration expired, weighted " .. chosen.path_type .. " → " .. chosen.name
+        end
+
+        -- No eligible non-event exit right now (e.g. all exits are phase-gated
+        -- to another time of day) — fall back to the first available regress,
+        -- then progress edge, so the state can't get stuck forever.
         for _, cand in ipairs(candidates) do
             if cand.type == "regress" then
                 local def: any = get_state_definition(season, cand.name)
                 if def then
                     transition_state.cooldown = TRANSITION_COOLDOWN_CYCLES
                     transition_state.duration_timer = 0
-                    return cand.name, def, "duration expired, regress → " .. cand.name
+                    return cand.name, def, "duration expired, fallback regress → " .. cand.name
                 end
             end
         end
@@ -1008,7 +1129,7 @@ local function evaluate_progression(current_state_def: any, season: string, curr
                 if def then
                     transition_state.cooldown = TRANSITION_COOLDOWN_CYCLES
                     transition_state.duration_timer = 0
-                    return cand.name, def, "duration expired, progress → " .. cand.name
+                    return cand.name, def, "duration expired, fallback progress → " .. cand.name
                 end
             end
         end
@@ -1222,6 +1343,12 @@ local function execute_state_transition(new_state_name: string, new_state_def: a
         transition_state.duration_timer = 0
         transition_state.state_changed_at = os.time()
 
+        -- Recurrence tracking: both the outgoing state (active until now)
+        -- and the incoming state were just seen.
+        transition_state.last_seen = transition_state.last_seen or {}
+        transition_state.last_seen[old_state_name] = os.time()
+        transition_state.last_seen[new_state_name] = os.time()
+
         -- Parse and set duration target and minimum
         local duration_str: string = new_state_def.duration or "1-6"
         transition_state.duration_target = choose_duration_cycles(duration_str)
@@ -1272,6 +1399,11 @@ local function check_pending_transition(): ()
     transition_state.cooldown = TRANSITION_COOLDOWN_CYCLES
     transition_state.duration_timer = 0
     transition_state.state_changed_at = os.time()
+
+    -- Recurrence tracking: both the outgoing and incoming state were just seen.
+    transition_state.last_seen = transition_state.last_seen or {}
+    transition_state.last_seen[pt.old_state_name] = os.time()
+    transition_state.last_seen[pt.state_name] = os.time()
 
     local duration_str: string = pt.state_def.duration or "1-6"
     transition_state.duration_target = choose_duration_cycles(duration_str)
@@ -1496,7 +1628,9 @@ register_with_main = function(): ()
     -- Extract initial targets
     local initial_targets: any = extract_targets_from_state(clear_skies, season)
 
-    -- Initialize transition state
+    -- Initialize transition state. Recurrence tracking (last_seen) survives
+    -- re-registration so overdue bonuses aren't reset by notecard reloads.
+    local previous_transition: any = lsd_read_json(LSD_KEY_TRANSITION) or {}
     local transition_state: any = {
         current = "Clear Skies",
         season = season,
@@ -1508,6 +1642,8 @@ register_with_main = function(): ()
         lock = nil,
         target_bias = nil,
         state_changed_at = os.time(),
+        last_seen = previous_transition.last_seen or {},
+        tracking_since = previous_transition.tracking_since or os.time(),
     }
     lsd_write_json(LSD_KEY_TRANSITION, transition_state)
 
@@ -1551,38 +1687,69 @@ end
 --============ Admin Command Handling =========--
 
 -- Handle OP.ADMIN_TARGET: set target bias in the grid's transition LSD.
+-- The requested state name is resolved case-insensitively against the
+-- current season's state registry; unknown states are rejected with the
+-- list of valid states rather than silently stored.
 local function handle_admin_target(target_state: string, threshold_multiplier: number, weight_multiplier: number, expiry_minutes: number): ()
+    local season: string = get_season_from_sl_date()
+    local canonical_name: string? = resolve_state_name(season, target_state)
+    if not canonical_name then
+        ll.OwnerSay("[" .. SCRIPT_ID .. "] Target bias REJECTED: '" .. tostring(target_state)
+            .. "' is not a state in season " .. season
+            .. ". Valid states: " .. list_season_states(season))
+        return
+    end
+
     local transition: any = lsd_read_json(LSD_KEY_TRANSITION) or {}
     transition.target_bias = {
-        target_state = target_state,
+        target_state = canonical_name,
         threshold_multiplier = threshold_multiplier,
         weight_multiplier = weight_multiplier,
         set_at = os.time(),
         expires_at = os.time() + (expiry_minutes * 60),
     }
     lsd_write_json(LSD_KEY_TRANSITION, transition)
-    ll.OwnerSay("[" .. SCRIPT_ID .. "] Target bias set: " .. target_state
+    ll.OwnerSay("[" .. SCRIPT_ID .. "] Target bias set: " .. canonical_name
         .. " (expires in " .. tostring(expiry_minutes) .. " min)")
 end
 
 -- Handle OP.ADMIN_FORCE: force-lock the grid into a specific state.
+-- Resolves and validates the state name, then routes through the normal
+-- transition execution path so the processor receives real atmospheric
+-- targets (TARGET_PUSH) and a proper duration is set — not just a label.
 local function handle_admin_force(forced_state: string, lock_duration_minutes: number): ()
+    local season: string = get_season_from_sl_date()
+    local canonical_name: string? = resolve_state_name(season, forced_state)
+    if not canonical_name then
+        ll.OwnerSay("[" .. SCRIPT_ID .. "] Force REJECTED: '" .. tostring(forced_state)
+            .. "' is not a state in season " .. season
+            .. ". Valid states: " .. list_season_states(season))
+        return
+    end
+
+    local state_def: any = get_state_definition(season, canonical_name)
+    if not state_def then
+        ll.OwnerSay("[" .. SCRIPT_ID .. "] Force REJECTED: definition missing for "
+            .. season .. ":" .. canonical_name)
+        return
+    end
+
     local transition: any = lsd_read_json(LSD_KEY_TRANSITION) or {}
     transition.lock = {
         locked = true,
-        forced_state = forced_state,
+        forced_state = canonical_name,
         locked_at = os.time(),
         expires_at = os.time() + (lock_duration_minutes * 60),
     }
-    transition.current = forced_state
-    lsd_write_json(LSD_KEY_TRANSITION, transition)
 
-    -- Also update the runtime state
-    local state: any = lsd_read_json(LSD_KEY_STATE) or {}
-    state.current_state = forced_state
-    lsd_write_json(LSD_KEY_STATE, state)
+    -- Cancel any in-flight ramping transition so it can't commit over the force.
+    pending_transition = nil
 
-    ll.OwnerSay("[" .. SCRIPT_ID .. "] Force locked: " .. forced_state
+    -- Immediate commit (skip_ramp) — pushes targets, updates runtime state,
+    -- records history, and persists the transition (including the lock).
+    execute_state_transition(canonical_name, state_def, season, transition, "admin force", true)
+
+    ll.OwnerSay("[" .. SCRIPT_ID .. "] Force locked: " .. canonical_name
         .. " for " .. tostring(lock_duration_minutes) .. " min")
 end
 
@@ -1644,6 +1811,16 @@ local function handle_admin_dump(): ()
     end
     if transition.lock and transition.lock.locked then
         ll.OwnerSay("  Locked: " .. tostring(transition.lock.forced_state))
+    end
+
+    -- Recurrence tracking: hours since each season state last occurred
+    local season_names: {string} = lsd_read_json("season_states:" .. tostring(state.season or "")) or {}
+    if #season_names > 0 then
+        local parts: {string} = {}
+        for _, name in ipairs(season_names) do
+            table.insert(parts, name .. "=" .. string.format("%.1f", hours_since_seen(transition, name)) .. "h")
+        end
+        ll.OwnerSay("  Last seen: " .. table.concat(parts, ", "))
     end
     ll.OwnerSay("  === END DUMP ===")
 end

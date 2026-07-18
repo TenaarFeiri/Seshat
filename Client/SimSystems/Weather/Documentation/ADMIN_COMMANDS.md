@@ -34,26 +34,28 @@ Resets the processor system. Does not target a specific grid.
 /-88888 reset full
 ```
 
-### `target <grid_uuid|all> <state_name>`
+### `target <grid_uuid|all> <state name>`
 
-Sets a target bias on the grid, making transitions toward the specified state more likely. Halves the condition thresholds and multiplies the weight by 10x for the biased target path. The bias expires after 30 minutes.
+Sets a target bias on the grid, making transitions toward the specified state more likely. State names may contain spaces (`target all Partly Cloudy`) and are matched case-insensitively against the current season's states. If the state doesn't exist in the current season, the grid rejects the bias and lists the valid states.
 
-This does not force an immediate transition — it just makes the specified state easier to reach if conditions are close. Use `force` for an immediate lock.
+For the biased candidate, condition thresholds are eased in the permissive direction (trend thresholds moved halfway toward zero; humidity ±8, pressure ±3 hPa, temperature ±2 °C, wind ±5 kph) and its selection score is multiplied by 10× — in both normal condition-based picks and duration-expiry picks. The bias expires after 30 minutes.
+
+This does not force an immediate transition — it just makes the specified state easier to reach if conditions are close. Use `force` for an immediate lock. Note that Main reports the bias as *sent*; the grid reports it as *set* (or rejected) after validating.
 
 ```
 /-88888 target all Storm
-/-88888 target abc123-4567-... Hazy Heat
+/-88888 target abc123-4567-... hazy heat
 ```
 
-### `force <grid_uuid|all> <state_name> [minutes]`
+### `force <grid_uuid|all> <state name> [minutes]`
 
-Force-locks the grid into a specific state. The grid transitions immediately and cannot transition away while the lock is active. Defaults to 30 minutes if no duration is specified.
+Force-locks the grid into a specific state. State names may contain spaces and are matched case-insensitively; unknown states are rejected with the valid list. A trailing numeric token is taken as the lock duration in minutes (default 30).
 
-The lock prevents all condition-based and duration-based transitions. Use `unlock` to release early.
+The grid transitions immediately through the normal transition path — new atmospheric targets are pushed to the processor (so temperature, humidity, pressure, wind, and visuals all follow), and the transition is recorded in history. The lock prevents all condition-based and duration-based transitions. Use `unlock` to release early.
 
 ```
 /-88888 force all Khamsin 60
-/-88888 force abc123-4567-... Storm
+/-88888 force abc123-4567-... partly cloudy 45
 ```
 
 ### `unlock <grid_uuid|all>`
@@ -74,6 +76,7 @@ Dumps the grid's current runtime state to owner chat. Shows:
 - Cooldown status (if active)
 - Pressure history entry count and computed trend
 - Active target bias or forced lock (if any)
+- Recurrence tracking: hours since each of the season's states last occurred
 
 ```
 /-88888 dump all
@@ -108,8 +111,8 @@ Toggles debug mode on the grid. When enabled, the grid may emit additional diagn
 | Command | Target | Arguments | Description |
 |---|---|---|---|
 | `reset` | system | `[full\|soft]` | Reset processor system |
-| `target` | grid | `<state_name>` | Bias transitions toward a state (30 min expiry) |
-| `force` | grid | `<state_name> [minutes]` | Lock grid into a state (default 30 min) |
+| `target` | grid | `<state name>` | Bias transitions toward a state (30 min expiry) |
+| `force` | grid | `<state name> [minutes]` | Lock grid into a state (default 30 min) |
 | `unlock` | grid | — | Release forced lock |
 | `dump` | grid | — | Show current state and tracking data |
 | `history` | grid | — | Show last 20 transitions with reasons |
@@ -124,7 +127,9 @@ The `history` command reports why each transition occurred. Possible reasons:
 | `progress condition met → <state>` | A progression condition (trend and/or humidity) was met for the target state |
 | `regress condition met → <state>` | A regression condition was met for the target state |
 | `diverge condition met → <state>` | A divergence condition (pressure/threshold) was met for an event state |
-| `multiple conditions met, weighted pick → <state>` | Multiple candidates were ready; weight-based tiebreaker chose this one |
-| `duration expired, regress → <state>` | Max duration reached; forced regression (preferred over progression) |
-| `duration expired, progress → <state>` | Max duration reached; no regress path available, forced progression |
+| `multiple conditions met, weighted pick → <state>` | Multiple candidates were ready; score-based pick (weight × overdue bonus × target bias) chose this one |
+| `duration expired, weighted <type> → <state>` | Max duration reached; weighted pick among all legal non-event exits (sun-phase gates still apply; states unseen for a long time score higher) |
+| `duration expired, fallback regress → <state>` | Max duration reached but no exit was eligible (e.g. all phase-gated to another time of day); first regress edge taken as escape hatch |
+| `duration expired, fallback progress → <state>` | As above, but no regress edge existed; first progress edge taken |
+| `admin force` | Owner issued a `force` command |
 | `bootstrap: pressure delta from baseline` | Cold-boot evaluation detected conditions warranting a non-Clear-Skies start |

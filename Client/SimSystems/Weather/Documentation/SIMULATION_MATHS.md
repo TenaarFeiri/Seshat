@@ -895,64 +895,69 @@ function evaluate_progression(current_state_def, season, current_values, transit
         transition_state.duration_timer = 0
         return ready[1].name, ready[1].def
 
-    -- If multiple candidates are ready, use weight as tiebreaker
+    -- If multiple candidates are ready, weighted pick by score
     elseif #ready > 1 then
-        local chosen = pick_among_ready(ready)
+        local chosen = pick_by_score(ready)
         transition_state.cooldown = 6
         transition_state.duration_timer = 0
-        return chosen._name, chosen
+        return chosen.name, chosen.def
     end
 
     -- No candidates ready — check duration expiry
     if duration_timer >= (transition_state.duration_target or 999) then
-        -- Duration expired — prefer regression, then progression
+        -- Duration expired — weighted pick among ALL legal non-event exits.
+        -- Value-threshold gates are relaxed (the state must move on), but
+        -- sun-phase gates still apply and event states keep their strict
+        -- meteorological triggers.
+        local pool = {}
         for _, cand in ipairs(candidates) do
-            if cand.type == "regress" then
-                local def = get_state_definition(season, cand.name)
-                if def then
-                    transition_state.cooldown = 6
-                    transition_state.duration_timer = 0
-                    return cand.name, def
-                end
+            local def = get_state_definition(season, cand.name)
+            if def and not def.event and sun_phase_allowed(cand.type, current_state_def, cand.name) then
+                local score = candidate_score(def, cand.name, transition_state, ...)
+                table.insert(pool, {def = def, name = cand.name, score = score})
             end
         end
-        for _, cand in ipairs(candidates) do
-            if cand.type == "progress" then
-                local def = get_state_definition(season, cand.name)
-                if def then
-                    transition_state.cooldown = 6
-                    transition_state.duration_timer = 0
-                    return cand.name, def
-                end
-            end
+        if #pool > 0 then
+            return pick_by_score(pool)
         end
+        -- Escape hatch when nothing is eligible (e.g. all exits phase-gated
+        -- to another time of day): first regress edge, then first progress.
+        ...
     end
 
     return nil
 end
 ```
 
-### Weight as tiebreaker
+### Score-based selection
 
-If multiple progression paths have their conditions met simultaneously, `weight` breaks the tie using weighted random selection:
+Whenever more than one exit is viable — multiple conditions met simultaneously, or duration expiry — candidates are picked by weighted random selection over a score:
 
 ```
-function pick_among_ready(ready_candidates)
-    local total_weight = 0
-    for _, cand in ipairs(ready_candidates) do
-        total_weight = total_weight + (cand.def.weight or 1)
+score = weight × min(1 + hours_since_seen / 24, 6) × (10 if admin-biased target)
+```
+
+- **`weight`** is the authored notecard weight — the baseline climatological likelihood.
+- **Overdue bonus**: `last_seen` timestamps are tracked per state (persisted across notecard reloads). A state unseen for 24 hours scores double; the bonus is capped at 6×. This guarantees every normal state configured for a season recurs periodically instead of merely having nonzero probability, and prevents two-state loops (e.g. Clear Skies ↔ Hazy Heat) from monopolizing a season.
+- **Target bias**: the admin `target` command multiplies the biased candidate's score by 10 and eases its condition thresholds in the permissive direction (trend thresholds are moved halfway toward zero; humidity/pressure/temp/wind thresholds are shifted by fixed easing amounts). Measured values are never altered — only the thresholds they are compared against.
+
+```
+function pick_by_score(scored_candidates)
+    local total_score = 0
+    for _, cand in ipairs(scored_candidates) do
+        total_score = total_score + cand.score
     end
 
-    local roll = math.random() * total_weight
+    local roll = math.random() * total_score
     local cumulative = 0
-    for _, cand in ipairs(ready_candidates) do
-        cumulative = cumulative + (cand.def.weight or 1)
+    for _, cand in ipairs(scored_candidates) do
+        cumulative = cumulative + cand.score
         if roll <= cumulative then
-            return cand.def
+            return cand
         end
     end
 
-    return ready_candidates[1].def
+    return scored_candidates[1]
 end
 ```
 
@@ -1115,12 +1120,14 @@ The duration is split into `duration_min` (the minimum hours, converted to cycle
 | Background pressure driver (synoptic systems, mesoscale wave, noise, anomaly coupling) | Proc3 | Every cycle (2.5s) |
 | Thermal & moisture pressure coupling | Proc3 | Every cycle (reads drivers:conditions) |
 | Per-season event-state list | `Weather_Grid.slua` | `flush_season_events()` — written to `season_events:<season>` during notecard parsing, consumed by `bootstrap_evaluate()` |
+| Per-season state-name registry | `Weather_Grid.slua` | `flush_season_states()` — written to `season_states:<season>` during notecard parsing, consumed by admin name resolution and recurrence dump |
 | Pressure trend exposure (pass-through) | Proc1 | Every cycle (reads drivers:pressure, writes to macro:evolution) |
 | Pressure history recording | Grid | Every poll (15s ±5s jitter) |
 | Time-windowed trend computation | Grid | Every poll (5-min linear regression over history) |
 | Driver trend cross-check | Grid | Every poll (compares local trend vs Proc3 trend) |
 | Progression condition check (data-driven) | Grid | Every poll (evaluates candidates against local trend + sun phase) |
 | Progression decision (condition + duration) | Grid | Every poll |
-| Weight tiebreaker (if multiple paths ready) | Grid | On simultaneous condition met |
+| Score-based selection (weight × overdue × bias) | Grid | On simultaneous condition met, and on duration expiry |
+| Recurrence tracking (`last_seen` per state) | Grid | On every transition commit |
 | Target parameter extraction | Grid | On progression decision |
 | Duration parsing | Grid | On state entry |

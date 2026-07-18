@@ -712,27 +712,36 @@ local function execute_admin_command(command_string: string, sender_key: string)
     end
 
     if command == ADMIN_CMD_TARGET then
-        -- target <grid_uuid|all> <state_name>
+        -- target <grid_uuid|all> <state name...>
+        -- State names may contain spaces (e.g. "Partly Cloudy") — join the
+        -- remaining tokens. The grid validates the name against its season.
         if #tokens < 3 then
-            ll.OwnerSay("[" .. SCRIPT_ID .. "] Usage: target <grid_uuid|all> <state_name>")
+            ll.OwnerSay("[" .. SCRIPT_ID .. "] Usage: target <grid_uuid|all> <state name>")
             return
         end
-        local state_name: string = tokens[3]
+        local state_name: string = table.concat(tokens, " ", 3)
         for _, grid_uuid in ipairs(target_grids) do
             send_admin_to_grid(grid_uuid, ADMIN_CMD_TARGET, state_name)
         end
 
     elseif command == ADMIN_CMD_FORCE then
-        -- force <grid_uuid|all> <state_name> [minutes]
+        -- force <grid_uuid|all> <state name...> [minutes]
+        -- State names may contain spaces; a trailing numeric token is taken
+        -- as the lock duration in minutes.
         if #tokens < 3 then
-            ll.OwnerSay("[" .. SCRIPT_ID .. "] Usage: force <grid_uuid|all> <state_name> [minutes]")
+            ll.OwnerSay("[" .. SCRIPT_ID .. "] Usage: force <grid_uuid|all> <state name> [minutes]")
             return
         end
-        local state_name: string = tokens[3]
+        local last_token_index: number = #tokens
         local duration_minutes: number? = nil
-        if #tokens >= 4 then
-            duration_minutes = tonumber(tokens[4])
+        if last_token_index > 3 then
+            local trailing_number: number? = tonumber(tokens[last_token_index])
+            if trailing_number then
+                duration_minutes = trailing_number
+                last_token_index = last_token_index - 1
+            end
         end
+        local state_name: string = table.concat(tokens, " ", 3, last_token_index)
         local force_data: any = {state = state_name, duration = duration_minutes}
         for _, grid_uuid in ipairs(target_grids) do
             send_admin_to_grid(grid_uuid, ADMIN_CMD_FORCE, force_data)
