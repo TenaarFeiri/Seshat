@@ -358,8 +358,17 @@ local function handle_register(grid_uuid: string, config: any, targets: any): ()
     ll.OwnerSay("[" .. SCRIPT_ID .. "] Grid registered: " .. grid_uuid)
 end
 
--- Handle UNREGISTER: remove grid from registry, clean up namespace.
+-- Handle UNREGISTER: remove grid from registry, clean up namespace, notify grid.
 local function handle_unregister(grid_uuid: string): ()
+    local envelope: any = build_envelope(
+        {OP.UNREGISTER},
+        ll.GetKey(),
+        SCRIPT_ID,
+        {RECIPIENT.GRID},
+        {{grid_uuid}}
+    )
+    send_to_grid(grid_uuid, envelope)
+
     remove_grid_from_registry(grid_uuid)
     cleanup_grid_namespace(grid_uuid)
     grid_last_heard_from[grid_uuid] = nil
@@ -374,9 +383,31 @@ local function handle_target_push(grid_uuid: string, targets: any): ()
     grid_last_heard_from[grid_uuid] = os.time()
 end
 
--- Handle STATE_POLL: relay the poll to Proc1 via link message.
--- Proc1 will read the namespace, assemble the response, and send STATE_RESP back.
+-- Handle STATE_POLL: relay the poll to Proc1 via link message if grid is registered.
+-- If grid is not registered, reply with UNREGISTER so the grid can re-register.
 local function handle_state_poll(grid_uuid: string): ()
+    local registered_grids: {string} = get_registered_grids()
+    local is_registered: boolean = false
+    for _, existing_uuid in ipairs(registered_grids) do
+        if existing_uuid == grid_uuid then
+            is_registered = true
+            break
+        end
+    end
+
+    if not is_registered then
+        ll.OwnerSay("[" .. SCRIPT_ID .. "] WARNING: Unregistered grid " .. grid_uuid .. " sent STATE_POLL — sending unregister notice to prompt re-registration.")
+        local envelope: any = build_envelope(
+            {OP.UNREGISTER},
+            ll.GetKey(),
+            SCRIPT_ID,
+            {RECIPIENT.GRID},
+            {{grid_uuid}}
+        )
+        send_to_grid(grid_uuid, envelope)
+        return
+    end
+
     local envelope: any = build_envelope(
         {OP.STATE_POLL},
         ll.GetKey(),

@@ -125,6 +125,12 @@ local notecard_loaded: boolean = false
 -- Whether the grid has registered with Main
 local is_registered: boolean = false
 
+-- Time limit for missing state responses before marking registration as stale (seconds)
+local STALE_RESP_TIMEOUT_SECONDS: number = 60
+
+-- Timestamp of the last valid state response received from Main
+local last_valid_state_resp_time: number = 0
+
 -- Whether this is the first poll after boot (for bootstrap evaluation)
 local is_first_poll: boolean = true
 
@@ -1495,6 +1501,15 @@ local function handle_state_resp(values: any, evolution: any): ()
         return
     end
 
+    -- Validate that values contains valid computed weather data from Proc1/Proc2.
+    -- If values is nil or temp is missing, the processor has purged this grid's LSD namespace.
+    if not values or values.temp == nil then
+        ll.OwnerSay("[" .. SCRIPT_ID .. "] WARNING: Invalid state response received from Main — registration may be stale.")
+        return
+    end
+
+    last_valid_state_resp_time = os.time()
+
     local season: string = get_season_from_sl_date()
 
     -- Read current transition state from LSD
@@ -1585,6 +1600,16 @@ start_polling = function(): ()
 
     poll_timer_handler = LLTimers:every(ACTUAL_POLL_INTERVAL_SECONDS, function()
         check_pending_transition()
+
+        -- Check if state responses have timed out (e.g. processor purged grid or reset)
+        if is_registered and last_valid_state_resp_time > 0 then
+            local elapsed_since_resp: number = os.time() - last_valid_state_resp_time
+            if elapsed_since_resp > STALE_RESP_TIMEOUT_SECONDS then
+                ll.OwnerSay("[" .. SCRIPT_ID .. "] WARNING: State response timed out (" .. tostring(elapsed_since_resp) .. "s) — marking registration stale.")
+                is_registered = false
+            end
+        end
+
         send_state_poll()
     end)
 end
@@ -1660,6 +1685,7 @@ register_with_main = function(): ()
     -- Send REGISTER to Main
     send_register(config, initial_targets)
     is_registered = true
+    last_valid_state_resp_time = os.time()
 
     ll.OwnerSay("[" .. SCRIPT_ID .. "] Registered with Main. Season: " .. season .. ", initial state: Clear Skies")
 end
@@ -1887,11 +1913,22 @@ LLEvents:on("listen", function(channel: number, name: string, sender_uuid: strin
                     lsd_write(LSD_KEY_PROCESSOR_KEY, discovered_processor_key)
                     ll.OwnerSay("[" .. SCRIPT_ID .. "] Processor discovered: " .. discovered_processor_key)
                 end
-                -- If notecard is loaded but we haven't registered yet, do so now
-                if notecard_loaded and not is_registered then
+                -- If notecard is loaded, register if unregistered or if state responses have timed out
+                local resp_stale: boolean = (last_valid_state_resp_time > 0) and ((os.time() - last_valid_state_resp_time) > STALE_RESP_TIMEOUT_SECONDS)
+                if notecard_loaded and (not is_registered or resp_stale) then
+                    ll.OwnerSay("[" .. SCRIPT_ID .. "] Beacon received while unregistered/stale — registering with Main.")
                     register_with_main()
                     start_polling()
                 end
+            end
+
+        elseif op_id == OP.UNREGISTER then
+            -- Notice from Main that our registration was purged or lapsed
+            ll.OwnerSay("[" .. SCRIPT_ID .. "] Received UNREGISTER notice from Main — re-registering...")
+            is_registered = false
+            if notecard_loaded then
+                register_with_main()
+                start_polling()
             end
 
         elseif op_id == OP.STATE_RESP then

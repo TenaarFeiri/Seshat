@@ -166,9 +166,9 @@ p = [grid_uuid, config, targets]
 
 No method — this is the only REGISTER variant.
 
-#### UNREGISTER (2) — Grid → Main
+#### UNREGISTER (2) — Bidirectional (Grid ↔ Main)
 
-Grid deregisters from the orchestrator.
+Grid deregisters from the orchestrator, or Main notifies a grid that its registration has been purged or lapsed (e.g. after timeout, full reset, or polling while unregistered).
 
 ```
 p = [grid_uuid]
@@ -177,6 +177,9 @@ p = [grid_uuid]
 | Position | Name | Type | Description |
 |---|---|---|---|
 | 1 | grid_uuid | string | Object UUID of the grid prim |
+
+When sent **Grid → Main**: Grid announces its departure.  
+When sent **Main → Grid**: Main notifies the grid prim that its LSD namespace and registry entry were purged, prompting the grid to set `is_registered = false` and re-register via `OP.REGISTER`.
 
 #### STATE_POLL (3) — Grid → Main → Proc1
 
