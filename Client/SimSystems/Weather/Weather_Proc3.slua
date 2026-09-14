@@ -37,6 +37,7 @@ local OP = {
     ADMIN_UNLOCK = 10,
     ADMIN_DUMP   = 11,
     ADMIN_DEBUG  = 12,
+    ACK          = 15,
 }
 
 -- Recipient IDs (from COMMS_PROTOCOL.md recipient table)
@@ -331,7 +332,7 @@ end
 
 -- Linear regression over the timestamped samples. Returns hPa per MINUTE
 -- (the unit used by the grids and all notecard trend thresholds).
--- Timestamps are offset from the first sample before squaring — raw unix
+-- Timestamps are offset from the first sample before squaring -- raw unix
 -- times (~1.7e9) squared lose enough float precision to corrupt the slope.
 local function compute_pressure_trend(): number
     local entry_count: number = #pressure_samples

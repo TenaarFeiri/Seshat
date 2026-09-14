@@ -39,7 +39,7 @@ This trades the resilience of direct point-to-point communication for simplicity
 ### Communication
 
 - Object-to-object communication uses `llRegionSayTo(targetKey, channel, message)` on a shared private channel. This targets specific objects by key with no per-call delay, unlike `llInstantMessage`.
-- Messages are **idempotent** — re-sends are safe, which handles SL's occasional message drops without ACK protocols.
+- Messages are **idempotent** — re-sends are safe, and sequenced diagnostic ACKs identify whether Main received a message, Proc1 responded, and the grid handled the response.
 - Main routes all communication. Both registration and steady-state traffic flow through it:
 
 ```

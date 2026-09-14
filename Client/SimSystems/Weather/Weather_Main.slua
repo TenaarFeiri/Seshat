@@ -26,11 +26,17 @@ local LINK_ALL_SCRIPTS = -1
 
 -- Grid timeout: if no message from a grid in this many seconds, purge it.
 local GRID_TIMEOUT_SECONDS = 300
+local GRID_STATE_ACK_TIMEOUT_SECONDS = 60
 local TIMEOUT_CHECK_INTERVAL_SECONDS = 60
 
 -- Beacon: Main broadcasts its key periodically so grids can discover
 -- the processor object without hardcoding it in a notecard.
 local BEACON_INTERVAL_SECONDS = 30
+local WATCHDOG_IM_RECIPIENT: string = "5675c8a0-430b-4281-af36-60734935fad3"
+local WATCHDOG_LOG_MAX_ENTRIES: number = 2000
+local WATCHDOG_POLL_TIMEOUT_SECONDS: number = 90
+local WATCHDOG_PROC_RESPONSE_TIMEOUT_SECONDS: number = 90
+local WATCHDOG_SUMMARY_INTERVAL_SECONDS: number = 21600
 
 -- Operation IDs (from COMMS_PROTOCOL.md op table)
 local OP = {
@@ -48,6 +54,7 @@ local OP = {
     ADMIN_DEBUG  = 12,  -- Admin: toggle debug mode (Main → Grid)
     BEACON       = 13,  -- Main → all grids: discovery broadcast with processor key
     ADMIN_HISTORY = 14, -- Admin: dump transition history to owner chat (Main → Grid)
+    ACK           = 15, -- Diagnostic acknowledgement
 }
 
 -- Recipient IDs (from COMMS_PROTOCOL.md recipient table)
@@ -80,6 +87,7 @@ local ADMIN_CMD_RESET = "reset"
 local ADMIN_CMD_DUMP = "dump"
 local ADMIN_CMD_DEBUG = "debug"
 local ADMIN_CMD_HISTORY = "history"
+local ADMIN_CMD_WATCHDOG = "watchdog"
 
 -- Admin command parameters
 local ADMIN_RESET_PARAM_FULL = "full"
@@ -117,6 +125,13 @@ local MICRO_FIELD_KEYS: {string} = {
 -- Tracks the last unix timestamp we received any message from each grid.
 -- Used for timeout detection. Not persisted to LSD — resets on Main reboot.
 local grid_last_heard_from: { [string]: number } = {}
+local grid_last_poll_received: { [string]: number } = {}
+local grid_last_proc_response: { [string]: number } = {}
+local main_sequence_counter: number = 0
+local grid_last_ack: { [string]: any } = {}
+local grid_last_state_ack: { [string]: number } = {}
+local watchdog_log: {any} = {}
+local watchdog_failures: { [string]: any } = {}
 
 -- Tracks which proc recipient ID requested metadata for each grid.
 -- Used to route META_RESP back to the correct proc.
@@ -180,6 +195,156 @@ local function json_encode_safe(value: any): string
         return ""
     end
     return encoded
+end
+
+local function send_watchdog_alert(subject: string, detail: string): ()
+    local success, error_value = pcall(function()
+        ll.InstantMessage(WATCHDOG_IM_RECIPIENT,
+            "[Seshat Main Watchdog] " .. subject .. "\n" .. detail)
+    end)
+    if not success then
+        pcall(function()
+            ll.OwnerSay("[" .. SCRIPT_ID .. "] ERROR: Failed to send watchdog IM: " .. tostring(error_value))
+        end)
+    end
+end
+
+local function append_watchdog_log(kind: string, signature: string, grid_uuid: string, detail: string, count: number): ()
+    table.insert(watchdog_log, {
+        ts = os.time(),
+        kind = kind,
+        signature = signature,
+        grid_uuid = grid_uuid,
+        detail = detail,
+        count = count,
+    })
+    while #watchdog_log > WATCHDOG_LOG_MAX_ENTRIES do
+        table.remove(watchdog_log, 1)
+    end
+end
+
+local function watchdog_age(timestamp: number?, now: number): string
+    if not timestamp then
+        return "never"
+    end
+    return tostring(math.max(0, now - timestamp)) .. "s"
+end
+
+local function watchdog_context(grid_uuid: string, now: number): string
+    local last_ack: any = grid_last_ack[grid_uuid]
+    return "grid=" .. grid_uuid
+        .. " poll_age=" .. watchdog_age(grid_last_poll_received[grid_uuid], now)
+        .. " proc1_age=" .. watchdog_age(grid_last_proc_response[grid_uuid], now)
+        .. " state_ack_age=" .. watchdog_age(grid_last_state_ack[grid_uuid], now)
+        .. " last_ack_stage=" .. tostring(last_ack and last_ack.stage or "none")
+        .. " last_ack_sequence=" .. tostring(last_ack and last_ack.sequence or "none")
+end
+
+local function record_watchdog_failure(signature: string, stage: string, grid_uuid: string, detail: string): ()
+    local now: number = os.time()
+    local failure: any = watchdog_failures[signature]
+    local is_new: boolean = failure == nil
+    local is_recurrence: boolean = failure ~= nil and not failure.active
+
+    if not failure then
+        failure = {
+            stage = stage,
+            grid_uuid = grid_uuid,
+            first_at = now,
+            last_at = now,
+            count = 0,
+            episodes = 0,
+            active = false,
+            last_alert_at = 0,
+        }
+        watchdog_failures[signature] = failure
+    end
+
+    failure.last_at = now
+    failure.last_detail = detail
+    failure.count = failure.count + 1
+    if not failure.active then
+        failure.active = true
+        failure.episodes = failure.episodes + 1
+    end
+
+    local context: string = watchdog_context(grid_uuid, now)
+    if is_new then
+        append_watchdog_log("failure", signature, grid_uuid, detail .. " | " .. context, failure.count)
+        failure.last_alert_at = now
+        send_watchdog_alert("FIRST FAILURE: " .. stage,
+            "count=" .. tostring(failure.count) .. " episodes=" .. tostring(failure.episodes)
+                .. "\n" .. detail .. "\n" .. context)
+    elseif is_recurrence then
+        append_watchdog_log("recurrence", signature, grid_uuid, detail .. " | " .. context, failure.count)
+        failure.last_alert_at = now
+        send_watchdog_alert("FAILURE RECURRED: " .. stage,
+            "count=" .. tostring(failure.count) .. " episodes=" .. tostring(failure.episodes)
+                .. "\n" .. detail .. "\n" .. context)
+    elseif now - failure.last_alert_at >= WATCHDOG_SUMMARY_INTERVAL_SECONDS then
+        append_watchdog_log("summary", signature, grid_uuid, detail .. " | " .. context, failure.count)
+        failure.last_alert_at = now
+        send_watchdog_alert("ONGOING FAILURE: " .. stage,
+            "count=" .. tostring(failure.count) .. " episodes=" .. tostring(failure.episodes)
+                .. "\n" .. detail .. "\n" .. context)
+    end
+end
+
+local function resolve_watchdog_failure(signature: string, detail: string): ()
+    local failure: any = watchdog_failures[signature]
+    if not failure or not failure.active then
+        return
+    end
+
+    local now: number = os.time()
+    failure.active = false
+    failure.recovered_at = now
+    append_watchdog_log("recovery", signature, failure.grid_uuid, detail, failure.count)
+    send_watchdog_alert("RECOVERED: " .. failure.stage,
+        "count=" .. tostring(failure.count) .. " episodes=" .. tostring(failure.episodes)
+            .. "\n" .. detail .. "\n" .. watchdog_context(failure.grid_uuid, now))
+end
+
+local function clear_watchdog(): ()
+    watchdog_log = {}
+    watchdog_failures = {}
+end
+
+local function dump_watchdog(): ()
+    ll.OwnerSay("[" .. SCRIPT_ID .. "] === WATCHDOG SUMMARY ===")
+    ll.OwnerSay("  Ring entries: " .. tostring(#watchdog_log) .. "/" .. tostring(WATCHDOG_LOG_MAX_ENTRIES))
+
+    for signature, failure in pairs(watchdog_failures) do
+        ll.OwnerSay("  " .. signature .. " count=" .. tostring(failure.count)
+            .. " episodes=" .. tostring(failure.episodes)
+            .. " active=" .. tostring(failure.active)
+            .. " first=" .. tostring(failure.first_at)
+            .. " last=" .. tostring(failure.last_at))
+    end
+
+    local first_entry: number = math.max(1, #watchdog_log - 19)
+    ll.OwnerSay("  Recent log entries:")
+    for i = first_entry, #watchdog_log do
+        local entry: any = watchdog_log[i]
+        ll.OwnerSay("    " .. tostring(entry.ts) .. " " .. tostring(entry.kind)
+            .. " " .. tostring(entry.signature) .. " count=" .. tostring(entry.count)
+            .. " " .. tostring(entry.detail))
+    end
+    ll.OwnerSay("[" .. SCRIPT_ID .. "] === END WATCHDOG ===")
+end
+
+local function validate_envelope(envelope: any): boolean
+    if type(envelope) ~= "table" then return false end
+    if type(envelope.o) ~= "table" or type(envelope.t) ~= "table" or type(envelope.p) ~= "table" then
+        return false
+    end
+    if #envelope.o ~= #envelope.t or #envelope.o ~= #envelope.p then
+        return false
+    end
+    if envelope.f == nil or envelope.s == nil or envelope.s == "" then
+        return false
+    end
+    return true
 end
 
 --================================================//
@@ -291,15 +456,21 @@ end
 
 --============ Message Envelope ===============--
 
+local function next_main_sequence(): string
+    main_sequence_counter = main_sequence_counter + 1
+    return "MAIN-" .. tostring(os.time()) .. "-" .. tostring(main_sequence_counter)
+end
+
 -- Build a message envelope table.
 -- o: operations array (op IDs)
 -- f: from (sender object UUID, raw key — not concatenated)
 -- s: script id string (e.g. "MAIN", "PROC1", "GRID")
 -- t: recipients array (recipient IDs)
 -- p: payloads array (one per op)
-local function build_envelope(ops: {number}, from: any, script_id: string, recipients: {number}, payloads: {any}): any
+local function build_envelope(ops: {number}, from: any, script_id: string, recipients: {number}, payloads: {any}, sequence: string?): any
     return {
         o = ops,
+        q = sequence or next_main_sequence(),
         f = from,
         s = script_id,
         t = recipients,
@@ -315,6 +486,21 @@ local function send_to_grid(grid_uuid: string, envelope: any): ()
         return
     end
     ll.RegionSayTo(grid_uuid, COMMS_CHANNEL, message)
+end
+
+local function send_ack_to_grid(grid_uuid: string, sequence: any, stage: string, detail: string): ()
+    if sequence == nil or sequence == "" then
+        return
+    end
+    local envelope: any = build_envelope(
+        {OP.ACK},
+        ll.GetKey(),
+        SCRIPT_ID,
+        {RECIPIENT.GRID},
+        {{tostring(sequence), stage, detail}},
+        tostring(sequence)
+    )
+    send_to_grid(grid_uuid, envelope)
 end
 
 -- Send a message envelope to all processor scripts via link message.
@@ -340,6 +526,7 @@ end
 local function broadcast_beacon(): ()
     local envelope: any = {
         o = {OP.BEACON},
+        q = next_main_sequence(),
         f = ll.GetKey(),
         s = SCRIPT_ID,
         t = {RECIPIENT.GRID},
@@ -354,7 +541,11 @@ end
 local function handle_register(grid_uuid: string, config: any, targets: any): ()
     add_grid_to_registry(grid_uuid)
     scaffold_grid_namespace(grid_uuid, config, targets)
-    grid_last_heard_from[grid_uuid] = os.time()
+    local registered_at: number = os.time()
+    grid_last_heard_from[grid_uuid] = registered_at
+    grid_last_poll_received[grid_uuid] = registered_at
+    grid_last_proc_response[grid_uuid] = registered_at
+    grid_last_state_ack[grid_uuid] = registered_at
     ll.OwnerSay("[" .. SCRIPT_ID .. "] Grid registered: " .. grid_uuid)
 end
 
@@ -372,6 +563,10 @@ local function handle_unregister(grid_uuid: string): ()
     remove_grid_from_registry(grid_uuid)
     cleanup_grid_namespace(grid_uuid)
     grid_last_heard_from[grid_uuid] = nil
+    grid_last_poll_received[grid_uuid] = nil
+    grid_last_proc_response[grid_uuid] = nil
+    grid_last_ack[grid_uuid] = nil
+    grid_last_state_ack[grid_uuid] = nil
     pending_meta_requester[grid_uuid] = nil
     ll.OwnerSay("[" .. SCRIPT_ID .. "] Grid unregistered: " .. grid_uuid)
 end
@@ -385,7 +580,11 @@ end
 
 -- Handle STATE_POLL: relay the poll to Proc1 via link message if grid is registered.
 -- If grid is not registered, reply with UNREGISTER so the grid can re-register.
-local function handle_state_poll(grid_uuid: string): ()
+local function handle_state_poll(grid_uuid: string, sequence: any): ()
+    local received_at: number = os.time()
+    grid_last_poll_received[grid_uuid] = received_at
+    resolve_watchdog_failure("grid:" .. grid_uuid .. ":poll", "Grid poll received again")
+
     local registered_grids: {string} = get_registered_grids()
     local is_registered: boolean = false
     for _, existing_uuid in ipairs(registered_grids) do
@@ -402,7 +601,8 @@ local function handle_state_poll(grid_uuid: string): ()
             ll.GetKey(),
             SCRIPT_ID,
             {RECIPIENT.GRID},
-            {{grid_uuid}}
+            {{grid_uuid}},
+            sequence
         )
         send_to_grid(grid_uuid, envelope)
         return
@@ -413,20 +613,22 @@ local function handle_state_poll(grid_uuid: string): ()
         ll.GetKey(),
         SCRIPT_ID,
         {RECIPIENT.PROC1},
-        {{grid_uuid}}
+        {{grid_uuid}},
+        sequence
     )
     send_to_procs(envelope)
     grid_last_heard_from[grid_uuid] = os.time()
 end
 
 -- Handle STATE_RESP (from Proc1): relay computed values to the grid.
-local function handle_state_resp(grid_uuid: string, values: any, evolution: any): ()
+local function handle_state_resp(grid_uuid: string, values: any, evolution: any, sequence: any): ()
     local envelope: any = build_envelope(
         {OP.STATE_RESP},
         ll.GetKey(),
         SCRIPT_ID,
         {RECIPIENT.GRID},
-        {{grid_uuid, values, evolution}}
+        {{grid_uuid, values, evolution}},
+        sequence
     )
     send_to_grid(grid_uuid, envelope)
 end
@@ -460,19 +662,40 @@ local function handle_meta_resp(method: string, grid_uuid: string, data: any): (
     grid_last_heard_from[grid_uuid] = os.time()
 end
 
+local function handle_grid_ack(grid_uuid: string, sequence: any, stage: any, detail: any): ()
+    if sequence == nil or sequence == "" then
+        return
+    end
+    local received_at: number = os.time()
+    local ack_stage: string = tostring(stage or "unknown")
+    grid_last_ack[grid_uuid] = {
+        sequence = tostring(sequence),
+        stage = ack_stage,
+        detail = tostring(detail or ""),
+        received_at = received_at,
+    }
+    if ack_stage == "GRID_STATE_RX" then
+        grid_last_state_ack[grid_uuid] = received_at
+        resolve_watchdog_failure("grid:" .. grid_uuid .. ":state_ack", "GRID_STATE_RX received by Main")
+    end
+end
+
 --================================================//
 
 --========= Inbound Message Dispatch ===========--
 
 -- Process an inbound message envelope from a grid prim (via listen).
-local function process_inbound_from_grid(envelope: any): ()
+local function process_inbound_from_grid(envelope: any, sender_uuid: string): ()
     local ops: {number} = envelope.o or {}
     local payloads: {any} = envelope.p or {}
 
     for i, op_id in ipairs(ops) do
         local payload: any = payloads[i] or {}
 
-        if op_id == OP.REGISTER then
+        if op_id == OP.ACK then
+            handle_grid_ack(tostring(envelope.f), envelope.q, payload[2], payload[3])
+
+        elseif op_id == OP.REGISTER then
             local grid_uuid: string = payload[1]
             local config: any = payload[2]
             local targets: any = payload[3]
@@ -484,7 +707,7 @@ local function process_inbound_from_grid(envelope: any): ()
 
         elseif op_id == OP.STATE_POLL then
             local grid_uuid: string = payload[1]
-            handle_state_poll(grid_uuid)
+            handle_state_poll(grid_uuid, envelope.q)
 
         elseif op_id == OP.TARGET_PUSH then
             local grid_uuid: string = payload[1]
@@ -533,7 +756,10 @@ local function process_inbound_from_proc(envelope: any): ()
             local grid_uuid: string = payload[1]
             local values: any = payload[2]
             local evolution: any = payload[3]
-            handle_state_resp(grid_uuid, values, evolution)
+            grid_last_proc_response[grid_uuid] = os.time()
+            resolve_watchdog_failure("grid:" .. grid_uuid .. ":proc1_response", "STATE_RESP received from Proc1")
+            send_ack_to_grid(grid_uuid, envelope.q, "PROC1_RESP", "Proc1 response received by Main")
+            handle_state_resp(grid_uuid, values, evolution, envelope.q)
 
         elseif op_id == OP.META_REQ then
             local method: string = payload[1]
@@ -550,6 +776,35 @@ end
 
 --========== Timeout Tracking =================--
 
+local function check_grid_watchdog(grid_uuid: string, current_time: number): ()
+    local last_poll: number = grid_last_poll_received[grid_uuid] or 0
+    local poll_age: number = current_time - last_poll
+    if poll_age > WATCHDOG_POLL_TIMEOUT_SECONDS then
+        record_watchdog_failure("grid:" .. grid_uuid .. ":poll", "POLL", grid_uuid,
+            "No STATE_POLL received for " .. tostring(poll_age) .. "s")
+        return
+    end
+    resolve_watchdog_failure("grid:" .. grid_uuid .. ":poll", "STATE_POLL received")
+
+    local last_proc_response: number = grid_last_proc_response[grid_uuid] or 0
+    local proc_age: number = current_time - last_proc_response
+    if proc_age > WATCHDOG_PROC_RESPONSE_TIMEOUT_SECONDS then
+        record_watchdog_failure("grid:" .. grid_uuid .. ":proc1_response", "PROC1_RESPONSE", grid_uuid,
+            "No STATE_RESP received from Proc1 for " .. tostring(proc_age) .. "s")
+        return
+    end
+    resolve_watchdog_failure("grid:" .. grid_uuid .. ":proc1_response", "STATE_RESP received from Proc1")
+
+    local last_state_ack: number = grid_last_state_ack[grid_uuid] or 0
+    local ack_age: number = current_time - last_state_ack
+    if ack_age > GRID_STATE_ACK_TIMEOUT_SECONDS then
+        record_watchdog_failure("grid:" .. grid_uuid .. ":state_ack", "GRID_STATE_ACK", grid_uuid,
+            "No GRID_STATE_RX ACK received for " .. tostring(ack_age) .. "s")
+    else
+        resolve_watchdog_failure("grid:" .. grid_uuid .. ":state_ack", "GRID_STATE_RX ACK received")
+    end
+end
+
 -- Check all registered grids for timeout. Purge grids that haven't been heard from.
 local function check_grid_timeouts(): ()
     local current_time: number = os.time()
@@ -563,6 +818,8 @@ local function check_grid_timeouts(): ()
                 ll.OwnerSay("[" .. SCRIPT_ID .. "] Grid timed out: " .. grid_uuid
                     .. " (no response in " .. tostring(elapsed) .. "s)")
                 handle_unregister(grid_uuid)
+            else
+                check_grid_watchdog(grid_uuid, current_time)
             end
         end
     end
@@ -595,7 +852,12 @@ local function execute_full_reset(): ()
 
     -- Clear in-memory tracking
     grid_last_heard_from = {}
+    grid_last_poll_received = {}
+    grid_last_proc_response = {}
+    grid_last_ack = {}
+    grid_last_state_ack = {}
     pending_meta_requester = {}
+    clear_watchdog()
 
     -- Clear reset mode flag
     lsd_delete(LSD_KEY_RESET_MODE)
@@ -617,7 +879,12 @@ local function execute_soft_reset(): ()
 
     -- Clear in-memory tracking (will be repopulated as grids check in)
     grid_last_heard_from = {}
+    grid_last_poll_received = {}
+    grid_last_proc_response = {}
+    grid_last_ack = {}
+    grid_last_state_ack = {}
     pending_meta_requester = {}
+    clear_watchdog()
 
     lsd_delete(LSD_KEY_RESET_MODE)
 
@@ -676,6 +943,7 @@ local function send_admin_to_grid(grid_uuid: string, admin_action: string, data:
 
     local envelope: any = {
         o = {op_id},
+        q = next_main_sequence(),
         f = ll.GetKey(),
         s = SCRIPT_ID,
         t = {RECIPIENT.GRID},
@@ -710,6 +978,16 @@ local function execute_admin_command(command_string: string, sender_key: string)
     if #tokens == 0 then return end
 
     local command: string = string.lower(tokens[1])
+
+    if command == ADMIN_CMD_WATCHDOG then
+        if string.lower(tokens[2] or "") == "clear" then
+            clear_watchdog()
+            ll.OwnerSay("[" .. SCRIPT_ID .. "] Watchdog log and failure counters cleared.")
+        else
+            dump_watchdog()
+        end
+        return
+    end
 
     if command == ADMIN_CMD_RESET then
         -- reset [full|soft]
@@ -810,7 +1088,7 @@ local function execute_admin_command(command_string: string, sender_key: string)
 
     else
         ll.OwnerSay("[" .. SCRIPT_ID .. "] Unknown admin command: " .. command)
-        ll.OwnerSay("  Available: target, force, unlock, reset, dump, history, debug")
+        ll.OwnerSay("  Available: target, force, unlock, reset, dump, history, debug, watchdog")
     end
 end
 
@@ -884,12 +1162,15 @@ LLEvents:on("listen", function(channel: number, name: string, sender_uuid: strin
     if channel ~= COMMS_CHANNEL then return end
 
     local envelope: any = json_decode_safe(message)
-    if not envelope then
-        ll.OwnerSay("[" .. SCRIPT_ID .. "] WARNING: Failed to parse message from " .. tostring(sender_uuid))
+    if not envelope or not validate_envelope(envelope) then
+        ll.OwnerSay("[" .. SCRIPT_ID .. "] WARNING: Invalid message from " .. tostring(sender_uuid))
         return
     end
 
-    process_inbound_from_grid(envelope)
+    if envelope.o[1] ~= OP.ACK then
+        send_ack_to_grid(sender_uuid, envelope.q, "MAIN_RX", "validated by Main")
+    end
+    process_inbound_from_grid(envelope, sender_uuid)
 end)
 
 -- Listen for link messages from processor scripts (Proc1, Proc2, Proc3).
@@ -897,8 +1178,8 @@ LLEvents:on("link_message", function(sender_num: number, num: number, str: strin
     if num ~= LINK_MSG_MARKER then return end
 
     local envelope: any = json_decode_safe(str)
-    if not envelope then
-        ll.OwnerSay("[" .. SCRIPT_ID .. "] WARNING: Failed to parse link message")
+    if not envelope or not validate_envelope(envelope) then
+        ll.OwnerSay("[" .. SCRIPT_ID .. "] WARNING: Invalid link message")
         return
     end
 

@@ -78,7 +78,7 @@ return them. This separation keeps each script within the 64 KB memory limit.
 
 | File | Lines | Role |
 |------|-------|------|
-| `Weather_Main.slua` | 877 | Orchestrator. Grid registration, namespace scaffolding, message routing, reset pipeline, admin commands, beacon broadcast. No maths. |
+| `Weather_Main.slua` | 877 | Orchestrator. Grid registration, namespace scaffolding, message routing, reset pipeline, admin commands, beacon broadcast, and stage-aware watchdog diagnostics. No maths. |
 | `Weather_Proc1.slua` | 333 | Macro processor. Evolves macro:evolution metadata (relaxation rate, noise scale, pressure trend/offset). Assembles STATE_RESP from all micro fields. Round-robin every 7.5s. |
 | `Weather_Proc2.slua` | 516 | Micro processor. The core weather maths: relaxation, diurnal temperature, maritime influence, flood modifiers, pressure driver coupling, target interpolation during transitions. Writes all `micro:*` LSD keys. Round-robin every 7.5s. |
 | `Weather_Proc3.slua` | 811 | Environment driver. Computes global pressure variation (sinusoidal + noise + cyclone dips + thermal/moisture coupling), wind driver (oscillation + diurnal breeze + pressure gradient), and Nile flood state (deterministic from calendar). Writes `drivers:*` LSD keys. |
@@ -98,7 +98,7 @@ return them. This separation keeps each script within the 64 KB memory limit.
 | `Documentation/NOTECARD_FORMAT.md` | Reference for the notecard format. Every field in `{grid}`, `{season}`, and `[State]` sections, including transition edge and condition field syntax. Read this when editing the notecard. |
 | `Documentation/SIMULATION_MATHS.md` | All the maths: relaxation model, diurnal temperature, maritime influence, target interpolation, wind speed/direction, pressure driver, flood modifiers, transition evaluation. Formulas with explanation. |
 | `Documentation/WIND_DRIVER_DESIGN.md` | Design doc for the Proc3 wind driver. Covers the problems with the old per-grid wind model and the rationale for the global driver with diurnal breeze and pressure-gradient coupling. |
-| `Documentation/COMMS_PROTOCOL.md` | Message envelope format, integer op/recipient mappings, payload contracts for every operation (REGISTER, STATE_POLL, STATE_RESP, TARGET_PUSH, META_REQ/RESP, ADMIN_*, BEACON). |
+| `Documentation/COMMS_PROTOCOL.md` | Message envelope format, sequence IDs, diagnostic ACK stages, integer op/recipient mappings, and payload contracts for every operation (REGISTER, STATE_POLL, STATE_RESP, TARGET_PUSH, META_REQ/RESP, ADMIN_*, BEACON). |
 | `Documentation/ADMIN_COMMANDS.md` | Owner chat commands on channel -88888: reset, target, force, unlock, dump, history, debug. |
 | `Documentation/CLIMATE_DATA.md` | Sourced climate data for Alexandria (NOAA, Wikipedia, academic studies). Monthly temp/humidity/pressure/wind/precipitation averages, Khamsin characteristics, Nile flood cycle. Used to parameterize the notecard. |
 
@@ -168,15 +168,16 @@ return them. This separation keeps each script within the 64 KB memory limit.
 
 ```
 1. Grid timer fires (every 15s + jitter)
-2. Grid sends STATE_POLL to Main
-3. Main forwards STATE_POLL to Proc1 (link message)
+2. Grid sends sequenced STATE_POLL to Main
+   - Main returns a MAIN_RX diagnostic ACK after validation
+3. Main forwards STATE_POLL to Proc1 (link message) with the same sequence
 4. Proc1 calls evolve_grid_macro():
    - Reads drivers:pressure from Proc3's LSD
    - Writes macro:evolution with trend/offset/rate/noise
 5. Proc1 calls assemble_state_response():
    - Reads macro:evolution + all micro:* keys
-   - Sends STATE_RESP to Main (link message)
-6. Main forwards STATE_RESP to Grid (RegionSayTo)
+   - Sends sequenced STATE_RESP to Main (link message)
+6. Main returns a PROC1_RESP diagnostic ACK to Grid and forwards STATE_RESP with the same sequence
 7. Grid handle_state_resp():
    - Records pressure reading, computes local trend
    - Updates display (floating text)
@@ -187,6 +188,7 @@ return them. This separation keeps each script within the 64 KB memory limit.
    - If transition chosen:
      - execute_state_transition() -- updates state LSD, records history
      - send_target_push() -- sends new targets to Main
+   - Sends a GRID_STATE_RX diagnostic ACK to Main after the response handler completes
 8. Main handle_target_push():
    - Writes new targets to <uuid>:targets LSD
 9. Proc2 (next 7.5s tick):

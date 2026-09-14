@@ -37,6 +37,7 @@ local OP = {
     ADMIN_UNLOCK = 10,
     ADMIN_DUMP   = 11,
     ADMIN_DEBUG  = 12,
+    ACK          = 15,
 }
 
 -- Recipient IDs (from COMMS_PROTOCOL.md recipient table)
@@ -236,11 +237,12 @@ end
 
 -- Handle a STATE_POLL link message from Main.
 -- Assembles the response and sends STATE_RESP back to Main via link message.
-local function handle_state_poll(grid_uuid: string): ()
+local function handle_state_poll(grid_uuid: string, sequence: any): ()
     local response: any = assemble_state_response(grid_uuid)
 
     local envelope: any = {
         o = {OP.STATE_RESP},
+        q = sequence,
         f = ll.GetKey(),
         s = SCRIPT_ID,
         t = {RECIPIENT.MAIN},
@@ -284,7 +286,7 @@ local function process_link_message(envelope: any): ()
 
         if op_id == OP.STATE_POLL then
             local grid_uuid: string = payload[1]
-            handle_state_poll(grid_uuid)
+            handle_state_poll(grid_uuid, envelope.q)
         else
             -- Other ops are not expected by Proc1 in this phase
         end

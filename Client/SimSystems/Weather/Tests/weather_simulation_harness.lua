@@ -5,7 +5,7 @@
 
 local NOTECARD = arg[1] or "Client/SimSystems/Weather/Grid/Alexandria_Oasis.notecard"
 local STEP_SECONDS = 3600
-local ITERATIONS = 72
+local ITERATIONS = 168
 local OVERDUE_REFERENCE_HOURS = 24
 local OVERDUE_MAX_MULTIPLIER = 6
 
@@ -183,16 +183,21 @@ local function pick(pool)
     return pool[#pool]
 end
 
-local function synthetic_values(state, seconds)
+local function synthetic_values(state, seconds, include_marine_humidity)
     local sun = sun_direction(seconds)
     local cycle = (seconds / 3600) * 2 * math.pi / 18
     -- A coherent synthetic approaching low: pressure falls, humidity rises,
     -- and the negative trend peaks together. This gives the notecard's
     -- storm/divergence thresholds a realistic signal to evaluate.
     local low_signal = math.cos(cycle)
+    local morning_marine_humidity = include_marine_humidity and seconds < 12 * 3600
+        and sun.z > 0 and math.max(0, sun.x) * 14 or 0
+    local daytime_marine_humidity = include_marine_humidity
+        and sun.z >= 0.5 and 10 or 0
     return {
         temp = (state.temp_base or 25) + (state.temp_diurnal or 3) * sun.z,
-        humidity = math.max(0, math.min(100, (state.humidity or 50) - 3 * sun.z + 8 * low_signal)),
+        humidity = math.max(0, math.min(100, (state.humidity or 50) - 3 * sun.z
+            + 8 * low_signal + morning_marine_humidity + daytime_marine_humidity)),
         pressure = (state.pressure or 1013) - 5 * low_signal,
         trend = -0.35 * low_signal,
         wind_speed = 18,
@@ -207,7 +212,7 @@ local function simulate(season_name, states)
     for _ = 1, ITERATIONS do
         seconds, duration = seconds + STEP_SECONDS, duration + 1
         local state = states[current]
-        local values = synthetic_values(state, seconds)
+        local values = synthetic_values(state, seconds, season_name == "Shemu")
         local phase = sun_phase(values.sun)
         local ready = {}
         local minimum_duration, maximum_duration = duration_bounds(state.duration)

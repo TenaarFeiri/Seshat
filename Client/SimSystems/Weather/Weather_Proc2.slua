@@ -38,6 +38,7 @@ local OP = {
     ADMIN_UNLOCK = 10,
     ADMIN_DUMP   = 11,
     ADMIN_DEBUG  = 12,
+    ACK          = 15,
 }
 
 -- Recipient IDs (from COMMS_PROTOCOL.md recipient table)

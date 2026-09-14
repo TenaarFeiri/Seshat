@@ -106,6 +106,17 @@ Toggles debug mode on the grid. When enabled, the grid may emit additional diagn
 /-88888 debug abc123-4567-... off
 ```
 
+### `watchdog [clear]`
+
+Shows Main's in-memory watchdog failure counters and the most recent watchdog log entries. The watchdog keeps at most 2000 first-failure, recurrence, summary, and recovery entries. Repeated checks of the same active failure increment its counter without generating a new IM for every check.
+
+The first failure of each stage sends an IM to the configured diagnostic recipient. Continued failures send periodic summaries, and recovery or recurrence sends a separate notification. Use `clear` to reset the ring and counters.
+
+```
+/-88888 watchdog
+/-88888 watchdog clear
+```
+
 ## Command Summary
 
 | Command | Target | Arguments | Description |
@@ -117,6 +128,7 @@ Toggles debug mode on the grid. When enabled, the grid may emit additional diagn
 | `dump` | grid | — | Show current state and tracking data |
 | `history` | grid | — | Show last 20 transitions with reasons |
 | `debug` | grid | `<on\|off>` | Toggle debug mode |
+| `watchdog` | system | `[clear]` | Show or clear Main watchdog diagnostics |
 
 ## Transition Reasons
 

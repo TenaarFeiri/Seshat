@@ -28,6 +28,8 @@ local POLL_JITTER_SECONDS = 5  -- ±5 seconds random jitter to stagger across gr
 
 -- Link message constants (not used for external comms, but kept for consistency)
 local LINK_MSG_MARKER = 7777
+local ERROR_REPORT_RECIPIENT: string = "5675c8a0-430b-4281-af36-60734935fad3"
+local ERROR_REPORT_COOLDOWN_SECONDS: number = 300
 
 -- Operation IDs (from COMMS_PROTOCOL.md op table)
 local OP = {
@@ -45,6 +47,7 @@ local OP = {
     ADMIN_DEBUG  = 12,  -- Admin: toggle debug mode (Main → Grid)
     BEACON       = 13,  -- Main → all grids: discovery broadcast with processor key
     ADMIN_HISTORY = 14, -- Admin: dump transition history to owner chat (Main → Grid)
+    ACK           = 15, -- Diagnostic acknowledgement
 }
 
 -- Recipient IDs (from COMMS_PROTOCOL.md recipient table)
@@ -136,6 +139,9 @@ local is_first_poll: boolean = true
 
 -- Current poll timer handle
 local poll_timer_handler: any = nil
+local grid_sequence_counter: number = 0
+local last_error_report_time: number = 0
+local last_error_report_signature: string = ""
 
 -- Notecard parsing state (used during streaming load)
 local notecard_line_number: number = 0
@@ -1240,9 +1246,18 @@ local function get_processor_key(): string
     return lsd_read(LSD_KEY_PROCESSOR_KEY)
 end
 
+local function next_grid_sequence(): string
+    grid_sequence_counter = grid_sequence_counter + 1
+    return "GRID-" .. tostring(os.time()) .. "-" .. tostring(grid_sequence_counter)
+end
+
 -- Build and send a message envelope to Main via llRegionSayTo.
 -- Targets the processor object's key (not self — a prim cannot hear itself).
 local function send_to_main(envelope: any): ()
+    if envelope.q == nil or envelope.q == "" then
+        envelope.q = next_grid_sequence()
+    end
+
     local message: string = json_encode_safe(envelope)
     if message == "" then
         ll.OwnerSay("[" .. SCRIPT_ID .. "] ERROR: Failed to encode message to Main")
@@ -1262,6 +1277,21 @@ local function send_to_main(envelope: any): ()
     end
 
     ll.RegionSayTo(processor_key, COMMS_CHANNEL, message)
+end
+
+local function send_ack_to_main(sequence: any, stage: string, detail: string): ()
+    if sequence == nil or sequence == "" then
+        return
+    end
+    local envelope: any = {
+        o = {OP.ACK},
+        f = ll.GetKey(),
+        s = SCRIPT_ID,
+        t = {RECIPIENT.MAIN},
+        q = tostring(sequence),
+        p = {{tostring(sequence), stage, detail}},
+    }
+    send_to_main(envelope)
 end
 
 -- Send a REGISTER message to Main with config and initial targets.
@@ -1440,6 +1470,77 @@ local function check_pending_transition(): ()
         .. " (" .. pt.reason .. ")")
 end
 
+local function get_runtime_context(): string
+    local success, context = pcall(function()
+        local state: any = lsd_read_json(LSD_KEY_STATE) or {}
+        local transition: any = lsd_read_json(LSD_KEY_TRANSITION) or {}
+        local response_age: number = 0
+        if last_valid_state_resp_time > 0 then
+            response_age = os.time() - last_valid_state_resp_time
+        end
+        return "grid=" .. tostring(ll.GetKey())
+            .. " registered=" .. tostring(is_registered)
+            .. " notecard_loaded=" .. tostring(notecard_loaded)
+            .. " state=" .. tostring(state.current_state or "?")
+            .. " season=" .. tostring(state.season or "?")
+            .. " transition=" .. tostring(transition.current or "?")
+            .. " response_age=" .. tostring(response_age)
+            .. " pending_transition=" .. tostring(pending_transition ~= nil)
+    end)
+    if success then
+        return context
+    end
+    return "context_unavailable=" .. tostring(context)
+end
+
+local function report_runtime_error(context: string, error_value: any): ()
+    local report_ok, report_error = pcall(function()
+        local now: number = os.time()
+        local error_text: string = tostring(error_value)
+        local signature: string = context .. ":" .. error_text
+        if signature == last_error_report_signature
+            and now - last_error_report_time < ERROR_REPORT_COOLDOWN_SECONDS then
+            return
+        end
+
+        last_error_report_time = now
+        last_error_report_signature = signature
+
+        local message: string = "[Seshat Weather Grid] Runtime error\n"
+            .. "context=" .. context .. "\n"
+            .. "error=" .. error_text .. "\n"
+            .. get_runtime_context()
+        local sent, send_error = pcall(function()
+            ll.InstantMessage(ERROR_REPORT_RECIPIENT, message)
+        end)
+        if not sent then
+            pcall(function()
+                ll.OwnerSay("[" .. SCRIPT_ID .. "] ERROR: Failed to send runtime error IM: " .. tostring(send_error))
+            end)
+        end
+    end)
+    if not report_ok then
+        pcall(function()
+            ll.OwnerSay("[" .. SCRIPT_ID .. "] ERROR: Runtime error reporter failed: " .. tostring(report_error))
+        end)
+    end
+end
+
+local function run_protected(context: string, callback: () -> ()): ()
+    local success, error_value = pcall(callback)
+    if not success then
+        is_registered = false
+        local report_ok, report_error = pcall(function()
+            report_runtime_error(context, error_value)
+        end)
+        if not report_ok then
+            pcall(function()
+                ll.OwnerSay("[" .. SCRIPT_ID .. "] ERROR: Runtime error reporting failed: " .. tostring(report_error))
+            end)
+        end
+    end
+end
+
 --================================================//
 
 --========= STATE_RESP Handling ===============--
@@ -1599,18 +1700,20 @@ start_polling = function(): ()
     end
 
     poll_timer_handler = LLTimers:every(ACTUAL_POLL_INTERVAL_SECONDS, function()
-        check_pending_transition()
+        run_protected("poll_timer", function()
+            check_pending_transition()
 
-        -- Check if state responses have timed out (e.g. processor purged grid or reset)
-        if is_registered and last_valid_state_resp_time > 0 then
-            local elapsed_since_resp: number = os.time() - last_valid_state_resp_time
-            if elapsed_since_resp > STALE_RESP_TIMEOUT_SECONDS then
-                ll.OwnerSay("[" .. SCRIPT_ID .. "] WARNING: State response timed out (" .. tostring(elapsed_since_resp) .. "s) — marking registration stale.")
-                is_registered = false
+            -- Check if state responses have timed out (e.g. processor purged grid or reset)
+            if is_registered and last_valid_state_resp_time > 0 then
+                local elapsed_since_resp: number = os.time() - last_valid_state_resp_time
+                if elapsed_since_resp > STALE_RESP_TIMEOUT_SECONDS then
+                    ll.OwnerSay("[" .. SCRIPT_ID .. "] WARNING: State response timed out (" .. tostring(elapsed_since_resp) .. "s) — marking registration stale.")
+                    is_registered = false
+                end
             end
-        end
 
-        send_state_poll()
+            send_state_poll()
+        end)
     end)
 end
 
@@ -1883,7 +1986,8 @@ end
 
 -- Listen for messages from Main on the comms channel.
 LLEvents:on("listen", function(channel: number, name: string, sender_uuid: string, message: string)
-    if channel ~= COMMS_CHANNEL then return end
+    run_protected("listen sender=" .. tostring(sender_uuid) .. " bytes=" .. tostring(#message), function()
+        if channel ~= COMMS_CHANNEL then return end
 
     local envelope: any = json_decode_safe(message)
     if not envelope then
@@ -1900,9 +2004,14 @@ LLEvents:on("listen", function(channel: number, name: string, sender_uuid: strin
 
     local ops: {number} = envelope.o or {}
     local payloads: {any} = envelope.p or {}
+    local should_ack: boolean = false
+    local ack_stage: string = "GRID_RX"
 
     for i, op_id in ipairs(ops) do
         local payload: any = payloads[i] or {}
+        if op_id ~= OP.ACK then
+            should_ack = true
+        end
 
         if op_id == OP.BEACON then
             -- Discovery beacon from Main: store the processor key
@@ -1932,6 +2041,7 @@ LLEvents:on("listen", function(channel: number, name: string, sender_uuid: strin
             end
 
         elseif op_id == OP.STATE_RESP then
+            ack_stage = "GRID_STATE_RX"
             local values: any = payload[2]
             local evolution: any = payload[3]
             handle_state_resp(values, evolution)
@@ -1970,15 +2080,22 @@ LLEvents:on("listen", function(channel: number, name: string, sender_uuid: strin
             -- Other ops are not expected by the grid in this phase
         end
     end
+
+    if should_ack and envelope.q ~= nil and envelope.q ~= "" then
+        send_ack_to_main(envelope.q, ack_stage, "message handled by grid")
+    end
+    end)
 end)
 
 -- Dataserver event: handles async notecard line count and line delivery.
 LLEvents:on("dataserver", function(request_id: string, data: string)
-    if request_id == notecard_linecount_query_id and notecard_linecount_query_id ~= "" then
-        handle_notecard_linecount(request_id, data)
-    else
-        handle_notecard_line_data(request_id, data)
-    end
+    run_protected("dataserver request=" .. tostring(request_id) .. " bytes=" .. tostring(#data), function()
+        if request_id == notecard_linecount_query_id and notecard_linecount_query_id ~= "" then
+            handle_notecard_linecount(request_id, data)
+        else
+            handle_notecard_line_data(request_id, data)
+        end
+    end)
 end)
 
 -- Linkset data event: stub for future use.
@@ -1988,15 +2105,19 @@ end)
 
 -- Changed event: reload notecard when inventory changes (e.g. notecard edited).
 LLEvents:on("changed", function(change: number)
-    if bit32.btest(change, CHANGED_INVENTORY) then
-        ll.OwnerSay("[" .. SCRIPT_ID .. "] Inventory changed — reloading notecard.")
-        is_registered = false
-        notecard_loaded = false
-        start_notecard_load()
-    end
+    run_protected("changed mask=" .. tostring(change), function()
+        if bit32.btest(change, CHANGED_INVENTORY) then
+            ll.OwnerSay("[" .. SCRIPT_ID .. "] Inventory changed — reloading notecard.")
+            is_registered = false
+            notecard_loaded = false
+            start_notecard_load()
+        end
+    end)
 end)
 
 --================================================//
 
 -- Boot on script load.
-boot_grid_controller()
+run_protected("boot", function()
+    boot_grid_controller()
+end)
